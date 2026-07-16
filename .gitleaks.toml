@@ -1,0 +1,13 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Exact synthetic credentials used by public test fixtures"
+regexes = [
+  '''^my-secret-key-12345$''',
+  '''^sk-proj-abcd1234567890ABCD1234567890abcd1234567890ABCD12$''',
+  '''^sk-1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN$''',
+  '''^ghp_1234567890abcdefghijklmnopqrstuvwxyz$''',
+  '''^Bearer sk-proj-abcd1234567890ABCD1234567890abcd1234567890ABCD12$''',
+  '''^Bearer sk-ant-abcd1234567890ABCD1234567890abcd1234567890ABCD12$''',
+]

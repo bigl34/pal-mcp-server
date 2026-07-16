@@ -1,0 +1,66 @@
+# Upstream test fixtures and doc examples flagged as "secrets" by gitleaks.
+# All values follow the obvious "1234567890abc..." placeholder pattern and
+# exist in tests/test_pii_sanitizer.py (inputs to the PII redaction test),
+# simulator_tests/test_codereview_validation.py, and docs/*.md (config
+# examples). Verified harmless 2026-05-12 — see commit history on
+# BeehiveInnovations/pal-mcp-server for original context.
+
+# tests/test_pii_sanitizer.py
+3db49413ff29cf30b311715076bfad2c242f0fec:tests/test_pii_sanitizer.py:generic-api-key:81
+3db49413ff29cf30b311715076bfad2c242f0fec:tests/test_pii_sanitizer.py:generic-api-key:103
+3db49413ff29cf30b311715076bfad2c242f0fec:tests/test_pii_sanitizer.py:github-pat:107
+8eef4b67227256a24fc7f15efaad6a052c03289a:tests/test_pii_sanitizer.py:github-pat:29
+8eef4b67227256a24fc7f15efaad6a052c03289a:tests/test_pii_sanitizer.py:github-app-token:30
+7f92085c70037a676a3d6510c5305141823649c7:tests/test_pii_sanitizer.py:generic-api-key:67
+7f92085c70037a676a3d6510c5305141823649c7:tests/test_pii_sanitizer.py:generic-api-key:86
+7f92085c70037a676a3d6510c5305141823649c7:tests/test_pii_sanitizer.py:generic-api-key:110
+7f92085c70037a676a3d6510c5305141823649c7:tests/test_pii_sanitizer.py:github-app-token:30
+7f92085c70037a676a3d6510c5305141823649c7:tests/test_pii_sanitizer.py:github-pat:29
+7f92085c70037a676a3d6510c5305141823649c7:tests/test_pii_sanitizer.py:github-pat:89
+7f92085c70037a676a3d6510c5305141823649c7:tests/test_pii_sanitizer.py:github-pat:112
+
+# simulator_tests
+69a3121452738f0e35634521d08fb10caa870663:simulator_tests/test_codereview_validation.py:generic-api-key:169
+
+# docs (config + code-style examples)
+e37cb71da22e761c934064fe61297bea7cc7cab4:docs/user-guides/configuration.md:gcp-api-key:49
+e37cb71da22e761c934064fe61297bea7cc7cab4:docs/user-guides/configuration.md:gcp-api-key:81
+c5313b170adcf31caf57e8f38ad0e6c36dcd5f05:docs/contributing/code-style.md:generic-api-key:403
+edba01976893d12185c740c107bee5317b73eb7c:docs/contributing/code-style.md:generic-api-key:403
+
+# Entire checkpoint JSONL false positives from generated transcript metadata.
+08d28fc533eb53da2086217bcfb432f5801f141c:89/373f096186/0/full.jsonl:generic-api-key:7
+bc8825dd7f40a88296ae772fe91744f7257ded0a:c6/294d0fbb5c/0/full.jsonl:generic-api-key:7
+bc8825dd7f40a88296ae772fe91744f7257ded0a:c6/294d0fbb5c/0/full.jsonl:generic-api-key:42
+bc8825dd7f40a88296ae772fe91744f7257ded0a:c6/294d0fbb5c/0/full.jsonl:generic-api-key:49
+bc8825dd7f40a88296ae772fe91744f7257ded0a:c6/294d0fbb5c/0/full.jsonl:generic-api-key:110
+bc8825dd7f40a88296ae772fe91744f7257ded0a:c6/294d0fbb5c/0/full.jsonl:generic-api-key:195
+69cdbf10e0f9ed58651ecfc6c600ead82e13f460:7c/c8993dc616/0/full.jsonl:generic-api-key:7
+69cdbf10e0f9ed58651ecfc6c600ead82e13f460:7c/c8993dc616/0/full.jsonl:generic-api-key:172
+69cdbf10e0f9ed58651ecfc6c600ead82e13f460:7c/c8993dc616/0/full.jsonl:generic-api-key:173
+69cdbf10e0f9ed58651ecfc6c600ead82e13f460:7c/c8993dc616/0/full.jsonl:generic-api-key:255
+69cdbf10e0f9ed58651ecfc6c600ead82e13f460:7c/c8993dc616/0/full.jsonl:generic-api-key:345
+69cdbf10e0f9ed58651ecfc6c600ead82e13f460:7c/c8993dc616/0/full.jsonl:generic-api-key:346
+69cdbf10e0f9ed58651ecfc6c600ead82e13f460:7c/c8993dc616/0/full.jsonl:generic-api-key:348
+ea557c22f4611ccd200a60d03ac6b9e8cf39327a:ae/f66ad8fdcd/0/full.jsonl:generic-api-key:7
+ea557c22f4611ccd200a60d03ac6b9e8cf39327a:ae/f66ad8fdcd/0/full.jsonl:generic-api-key:68
+ea557c22f4611ccd200a60d03ac6b9e8cf39327a:ae/f66ad8fdcd/0/full.jsonl:generic-api-key:158
+ea557c22f4611ccd200a60d03ac6b9e8cf39327a:ae/f66ad8fdcd/0/full.jsonl:generic-api-key:400
+ea557c22f4611ccd200a60d03ac6b9e8cf39327a:ae/f66ad8fdcd/0/full.jsonl:generic-api-key:474
+ea557c22f4611ccd200a60d03ac6b9e8cf39327a:ae/f66ad8fdcd/0/full.jsonl:generic-api-key:723
+ea557c22f4611ccd200a60d03ac6b9e8cf39327a:ae/f66ad8fdcd/0/full.jsonl:generic-api-key:734
+8e2addaa6818cabe02c81868b9790ca4c66b7aa0:32/7fcffe5bd4/0/full.jsonl:generic-api-key:7
+8e2addaa6818cabe02c81868b9790ca4c66b7aa0:32/7fcffe5bd4/0/full.jsonl:generic-api-key:188
+8e2addaa6818cabe02c81868b9790ca4c66b7aa0:32/7fcffe5bd4/0/full.jsonl:generic-api-key:260
+8e2addaa6818cabe02c81868b9790ca4c66b7aa0:32/7fcffe5bd4/0/full.jsonl:generic-api-key:300
+1c513b36d59fde053cec35879355f9000b5804a3:c6/294d0fbb5c/1/full.jsonl:generic-api-key:7
+1c513b36d59fde053cec35879355f9000b5804a3:c6/294d0fbb5c/1/full.jsonl:generic-api-key:68
+1c513b36d59fde053cec35879355f9000b5804a3:c6/294d0fbb5c/1/full.jsonl:generic-api-key:158
+1c513b36d59fde053cec35879355f9000b5804a3:c6/294d0fbb5c/1/full.jsonl:generic-api-key:400
+1c513b36d59fde053cec35879355f9000b5804a3:c6/294d0fbb5c/1/full.jsonl:generic-api-key:474
+1c513b36d59fde053cec35879355f9000b5804a3:c6/294d0fbb5c/1/full.jsonl:generic-api-key:723
+1c513b36d59fde053cec35879355f9000b5804a3:c6/294d0fbb5c/1/full.jsonl:generic-api-key:734
+1c513b36d59fde053cec35879355f9000b5804a3:c6/294d0fbb5c/1/full.jsonl:generic-api-key:957
+1c513b36d59fde053cec35879355f9000b5804a3:c6/294d0fbb5c/1/full.jsonl:generic-api-key:988
+81acd31569165cc371f17987279a59a41e6212c1:e7/fd45d42c89/0/full.jsonl:generic-api-key:7
+3c0d5bc4c017cb645f293ce58b1e414dcb3db0db:b0/b059873e60/0/full.jsonl:generic-api-key:7
