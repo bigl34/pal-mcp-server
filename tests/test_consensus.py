@@ -2,11 +2,13 @@
 Tests for the Consensus tool using WorkflowTool architecture.
 """
 
+import asyncio
+import json
 from unittest.mock import Mock
 
 import pytest
 
-from tools.consensus import ConsensusRequest, ConsensusTool
+from tools.consensus import ConsensusChainState, ConsensusRequest, ConsensusTool
 from tools.models import ToolModelCategory
 
 
@@ -258,6 +260,96 @@ class TestConsensusTool:
         # The tool should set total_steps = len(models) = 2
         assert len(request.models) == 2
 
+    @pytest.mark.asyncio
+    async def test_concurrent_consensus_chains_keep_request_state_isolated(self, monkeypatch):
+        """A singleton tool may serve interleaved chains without mixing their state."""
+        tool = ConsensusTool()
+        first_consult_started = {
+            "proposal-a": asyncio.Event(),
+            "proposal-b": asyncio.Event(),
+        }
+
+        async def consult_model(
+            model_config,
+            request,
+            *,
+            original_proposal=None,
+            relevant_files=None,
+            images=None,
+        ):
+            del request, relevant_files, images
+            if model_config["model"].endswith("-first"):
+                first_consult_started[original_proposal].set()
+                await asyncio.gather(*(event.wait() for event in first_consult_started.values()))
+            return {
+                "model": model_config["model"],
+                "stance": model_config.get("stance", "neutral"),
+                "status": "success",
+                "verdict": f"{original_proposal}:{model_config['model']}",
+            }
+
+        monkeypatch.setattr(tool, "_consult_model", consult_model)
+
+        async def start_chain(label):
+            response = await tool.execute(
+                {
+                    "step": label,
+                    "step_number": 1,
+                    "total_steps": 2,
+                    "next_step_required": True,
+                    "findings": f"{label} findings",
+                    "models": [
+                        {"model": f"{label}-first", "stance": "for"},
+                        {"model": f"{label}-second", "stance": "against"},
+                    ],
+                }
+            )
+            return json.loads(response[0].text)
+
+        first_a, first_b = await asyncio.gather(start_chain("proposal-a"), start_chain("proposal-b"))
+
+        async def finish_chain(label, first_response):
+            continuation_id = first_response["continuation_offer"]["continuation_id"]
+            response = await tool.execute(
+                {
+                    "step": f"notes for {label}",
+                    "step_number": 2,
+                    "total_steps": 2,
+                    "next_step_required": False,
+                    "findings": f"{label} synthesis notes",
+                    "continuation_id": continuation_id,
+                }
+            )
+            return continuation_id, json.loads(response[0].text)
+
+        (continuation_a, final_a), (continuation_b, final_b) = await asyncio.gather(
+            finish_chain("proposal-a", first_a),
+            finish_chain("proposal-b", first_b),
+        )
+
+        assert continuation_a != continuation_b
+        assert final_a["complete_consensus"]["initial_prompt"] == "proposal-a"
+        assert final_b["complete_consensus"]["initial_prompt"] == "proposal-b"
+        assert final_a["complete_consensus"]["models_consulted"] == [
+            "proposal-a-first:for",
+            "proposal-a-second:against",
+        ]
+        assert final_b["complete_consensus"]["models_consulted"] == [
+            "proposal-b-first:for",
+            "proposal-b-second:against",
+        ]
+        assert [item["verdict"] for item in final_a["accumulated_responses"]] == [
+            "proposal-a:proposal-a-first",
+            "proposal-a:proposal-a-second",
+        ]
+        assert [item["verdict"] for item in final_b["accumulated_responses"]] == [
+            "proposal-b:proposal-b-first",
+            "proposal-b:proposal-b-second",
+        ]
+        assert not hasattr(tool, "models_to_consult")
+        assert not hasattr(tool, "accumulated_responses")
+        assert not hasattr(tool, "original_proposal")
+
     def test_consult_model_basic_structure(self):
         """Test basic model consultation structure."""
         tool = ConsensusTool()
@@ -402,7 +494,6 @@ class TestConsensusTool:
     @pytest.mark.asyncio
     async def test_consult_model_preserves_requested_logical_and_upstream_names(self):
         tool = ConsensusTool()
-        tool.original_proposal = "Test proposal"
         provider = Mock()
         provider.get_provider_type.return_value = Mock(value="openai")
         provider.generate_content.return_value = Mock(
@@ -417,6 +508,7 @@ class TestConsensusTool:
         result = await tool._consult_model(
             {"model": "gpt-5.5-pro", "stance": "neutral"},
             request,
+            original_proposal="Test proposal",
         )
 
         assert result["model"] == "gpt-5.5-pro"
@@ -430,7 +522,13 @@ class TestConsensusTool:
     def test_handle_work_continuation(self):
         """Test work continuation handling - legacy method for compatibility."""
         tool = ConsensusTool()
-        tool.models_to_consult = [{"model": "flash", "stance": "neutral"}, {"model": "o3-mini", "stance": "for"}]
+        chain_state = ConsensusChainState(
+            original_proposal="Test proposal",
+            models_to_consult=[
+                {"model": "flash", "stance": "neutral"},
+                {"model": "o3-mini", "stance": "for"},
+            ],
+        )
 
         # Note: In the new workflow, model consultation happens DURING steps in execute_workflow
         # This method is kept for compatibility but not actively used in the step-by-step flow
@@ -439,7 +537,7 @@ class TestConsensusTool:
         request = Mock(step_number=1, current_model_index=0)
         response_data = {}
 
-        result = tool.handle_work_continuation(response_data, request)
+        result = tool.handle_work_continuation(response_data, request, chain_state)
         # The method still exists but returns legacy status for compatibility
         assert "status" in result
 
@@ -447,23 +545,27 @@ class TestConsensusTool:
         request = Mock(step_number=2, current_model_index=1)
         response_data = {}
 
-        result = tool.handle_work_continuation(response_data, request)
+        result = tool.handle_work_continuation(response_data, request, chain_state)
         assert "status" in result
 
     def test_customize_workflow_response(self):
         """Test response customization for consensus workflow."""
         tool = ConsensusTool()
-        tool.accumulated_responses = [{"model": "test", "response": "data"}]
+        chain_state = ConsensusChainState(
+            original_proposal="Test proposal",
+            models_to_consult=[{"model": "test"}],
+            accumulated_responses=[{"model": "test", "response": "data"}],
+        )
 
         # Test different step numbers (new workflow: 2 models = 2 steps)
         request = Mock(step_number=1, total_steps=2)
         response_data = {}
-        result = tool.customize_workflow_response(response_data, request)
+        result = tool.customize_workflow_response(response_data, request, chain_state)
         assert result["consensus_workflow_status"] == "initial_analysis_complete"
 
         request = Mock(step_number=2, total_steps=2)
         response_data = {}
-        result = tool.customize_workflow_response(response_data, request)
+        result = tool.customize_workflow_response(response_data, request, chain_state)
         assert result["consensus_workflow_status"] == "ready_for_synthesis"
 
     @pytest.mark.asyncio
@@ -480,7 +582,7 @@ class TestConsensusTool:
         - Method expected model_context parameter but got None (default value)
         - Runtime validation in base_tool.py threw RuntimeError
         """
-        from unittest.mock import AsyncMock, Mock, patch
+        from unittest.mock import Mock, patch
 
         from utils.model_context import ModelContext
 
@@ -504,18 +606,18 @@ class TestConsensusTool:
 
             # Setup mocks
             mock_provider = Mock()
-            mock_provider.generate_content = AsyncMock(return_value={"response": "test response"})
+            mock_provider.generate_content = Mock(
+                return_value=Mock(content="test response", metadata={}, model_name="flash")
+            )
+            mock_provider.get_provider_type.return_value = Mock(value="google")
             mock_get_provider.return_value = mock_provider
             mock_prepare_files.return_value = ("file content", [])
             mock_get_prompt.return_value = "system prompt"
 
-            # Set up the tool's attributes that would be set during normal execution
-            tool.original_proposal = "Test proposal"
-
             try:
                 # This should not raise RuntimeError after the fix
                 # The method should create ModelContext and pass it to _prepare_file_content_for_prompt
-                await tool._consult_model(model_config, mock_request)
+                await tool._consult_model(model_config, mock_request, original_proposal="Test proposal")
 
                 # Verify that _prepare_file_content_for_prompt was called with model_context
                 mock_prepare_files.assert_called_once()

@@ -1,5 +1,6 @@
 import asyncio
 import shutil
+import signal
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ class DummyProcess:
         self.returncode = returncode
         self.args: list[str] | None = None
         self.env: dict[str, str] | None = None
+        self.spawn_kwargs: dict | None = None
 
     async def communicate(self, _input):
         return self._stdout, self._stderr
@@ -45,6 +47,7 @@ async def _run_agent_with_process(monkeypatch, agent, role, process, *, model=No
     async def fake_create_subprocess_exec(*args, **kwargs):
         process.args = list(args)
         process.env = kwargs.get("env")
+        process.spawn_kwargs = kwargs
         return process
 
     def fake_which(executable_name):
@@ -68,6 +71,113 @@ async def test_codex_agent_recovers_jsonl(monkeypatch, codex_agent):
     assert result.returncode == 124
     assert "Hello from Codex" in result.parsed.content
     assert result.parsed.metadata["usage"]["output_tokens"] == 5
+    assert result.recovery_metadata == {
+        "recovered": True,
+        "reason": "parseable_output_after_nonzero_exit",
+        "original_return_code": 124,
+    }
+    assert process.spawn_kwargs["start_new_session"] is True
+
+
+class HangingProcess:
+    """Controllable process double for timeout supervision."""
+
+    def __init__(self):
+        self.pid = 43210
+        self.returncode = None
+        self.release = asyncio.Event()
+        self.wait_calls = 0
+        self.spawn_kwargs: dict | None = None
+        self.last_signal = signal.SIGKILL
+
+    async def communicate(self, _input):
+        await self.release.wait()
+        return b"partial stdout", b"partial stderr"
+
+    async def wait(self):
+        self.wait_calls += 1
+        self.returncode = -self.last_signal
+        return self.returncode
+
+
+@pytest.mark.asyncio
+async def test_timeout_terminates_owned_process_group_then_reaps(monkeypatch, codex_agent):
+    agent, role = codex_agent
+    agent.client.timeout_seconds = 0.01
+    process = HangingProcess()
+    signals = []
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        del args
+        process.spawn_kwargs = kwargs
+        return process
+
+    def fake_killpg(process_group_id, sent_signal):
+        signals.append((process_group_id, sent_signal))
+        process.last_signal = sent_signal
+        if sent_signal == signal.SIGTERM:
+            process.release.set()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(shutil, "which", lambda executable_name: f"/usr/bin/{executable_name}")
+    monkeypatch.setattr("clink.agents.base.os.killpg", fake_killpg)
+    monkeypatch.setattr("clink.agents.base.PROCESS_TERMINATION_GRACE_SECONDS", 0.01)
+
+    with pytest.raises(CLIAgentError) as exc_info:
+        await agent.run(role=role, prompt="hang", files=[], images=[])
+
+    assert process.spawn_kwargs["start_new_session"] is True
+    assert signals == [(process.pid, signal.SIGTERM)]
+    assert process.wait_calls == 1
+    assert exc_info.value.stdout == "partial stdout"
+    assert exc_info.value.stderr == "partial stderr"
+    assert exc_info.value.metadata == {
+        "timed_out": True,
+        "timeout_seconds": 0.01,
+        "termination_reason": "timeout",
+        "process_id": process.pid,
+        "process_group_id": process.pid,
+        "term_signal": "SIGTERM",
+        "term_grace_seconds": 0.01,
+        "term_sent": True,
+        "kill_escalated": False,
+        "reap_confirmed": True,
+        "final_return_code": -signal.SIGTERM,
+    }
+
+
+@pytest.mark.asyncio
+async def test_timeout_escalates_stuck_process_group_to_kill(monkeypatch, codex_agent):
+    agent, role = codex_agent
+    agent.client.timeout_seconds = 0.01
+    process = HangingProcess()
+    signals = []
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        del args, kwargs
+        return process
+
+    def fake_killpg(process_group_id, sent_signal):
+        signals.append((process_group_id, sent_signal))
+        process.last_signal = sent_signal
+        if sent_signal == signal.SIGKILL:
+            process.release.set()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(shutil, "which", lambda executable_name: f"/usr/bin/{executable_name}")
+    monkeypatch.setattr("clink.agents.base.os.killpg", fake_killpg)
+    monkeypatch.setattr("clink.agents.base.PROCESS_TERMINATION_GRACE_SECONDS", 0.01)
+
+    with pytest.raises(CLIAgentError) as exc_info:
+        await agent.run(role=role, prompt="hang", files=[], images=[])
+
+    assert signals == [
+        (process.pid, signal.SIGTERM),
+        (process.pid, signal.SIGKILL),
+    ]
+    assert process.wait_calls == 1
+    assert exc_info.value.metadata["kill_escalated"] is True
+    assert exc_info.value.metadata["reap_confirmed"] is True
 
 
 @pytest.mark.asyncio

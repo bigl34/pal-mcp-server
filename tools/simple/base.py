@@ -778,9 +778,16 @@ class SimpleTool(BaseTool):
                     except AttributeError:
                         model_provider = str(provider)
             model_name = model_info.get("model_name")
+            explicit_metadata = model_info.get("model_metadata")
+            if isinstance(explicit_metadata, dict):
+                model_metadata = dict(explicit_metadata)
             model_response = model_info.get("model_response")
             if model_response:
-                model_metadata = {"usage": model_response.usage, "metadata": model_response.metadata}
+                response_metadata = {"usage": model_response.usage, "metadata": model_response.metadata}
+                if model_metadata:
+                    model_metadata.update(response_metadata)
+                else:
+                    model_metadata = response_metadata
 
         add_turn(
             continuation_id,

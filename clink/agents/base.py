@@ -7,6 +7,8 @@ import logging
 import os
 import shlex
 import shutil
+import signal
+import subprocess
 import tempfile
 import time
 from collections.abc import Sequence
@@ -18,6 +20,8 @@ from clink.models import ResolvedCLIClient, ResolvedCLIRole
 from clink.parsers import BaseParser, ParsedCLIResponse, ParserError, get_parser
 
 logger = logging.getLogger("clink.agent")
+
+PROCESS_TERMINATION_GRACE_SECONDS = 2.0
 
 
 @dataclass
@@ -47,6 +51,7 @@ class AgentOutput:
     effective_model: str | None = None
     configured_model: str | None = None
     model_source: str = "native"
+    recovery_metadata: dict[str, object] | None = None
 
 
 class CLIAgentError(RuntimeError):
@@ -146,22 +151,39 @@ class BaseCLIAgent:
                 cwd=cwd,
                 limit=limit,
                 env=env,
+                **self._process_group_creation_kwargs(),
             )
         except FileNotFoundError as exc:
             raise CLIAgentError(f"Executable not found for CLI '{self.client.name}': {exc}") from exc
 
+        communicate_task = asyncio.create_task(process.communicate(prompt.encode("utf-8")))
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(prompt.encode("utf-8")),
+                asyncio.shield(communicate_task),
                 timeout=self.client.timeout_seconds,
             )
         except asyncio.TimeoutError as exc:
-            process.kill()
-            await process.communicate()
+            stdout_bytes, stderr_bytes, termination_metadata = await self._terminate_process_group(
+                process,
+                communicate_task,
+                reason="timeout",
+            )
             raise CLIAgentError(
                 f"CLI '{self.client.name}' timed out after {self.client.timeout_seconds} seconds",
-                returncode=None,
+                returncode=process.returncode,
+                stdout=stdout_bytes.decode("utf-8", errors="replace"),
+                stderr=stderr_bytes.decode("utf-8", errors="replace"),
+                metadata={
+                    "timed_out": True,
+                    "timeout_seconds": self.client.timeout_seconds,
+                    **termination_metadata,
+                },
             ) from exc
+        except asyncio.CancelledError:
+            # MCP request cancellation must not strand the delegated CLI or any
+            # child it spawned. Complete group cleanup before propagating.
+            await self._terminate_process_group(process, communicate_task, reason="cancelled")
+            raise
 
         duration = time.monotonic() - start_time
         return_code = process.returncode
@@ -190,6 +212,11 @@ class BaseCLIAgent:
                 model_resolution=model_resolution,
             )
             if recovered is not None:
+                recovered.recovery_metadata = {
+                    "recovered": True,
+                    "reason": "parseable_output_after_nonzero_exit",
+                    "original_return_code": return_code,
+                }
                 return recovered
 
         if return_code != 0:
@@ -222,6 +249,83 @@ class BaseCLIAgent:
             output_file_content=output_file_content,
             model_resolution=model_resolution,
         )
+
+    def _process_group_creation_kwargs(self) -> dict[str, object]:
+        """Create a process-group boundary owned by this invocation."""
+        if os.name == "posix":
+            return {"start_new_session": True}
+        if os.name == "nt":  # pragma: no cover - exercised on Windows
+            return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        return {}
+
+    async def _terminate_process_group(
+        self,
+        process: asyncio.subprocess.Process,
+        communicate_task: asyncio.Task[tuple[bytes, bytes]],
+        *,
+        reason: str,
+    ) -> tuple[bytes, bytes, dict[str, object]]:
+        """Terminate the invocation's process group and always reap its leader."""
+        process_id = process.pid
+        group_id = process_id if os.name == "posix" else None
+        metadata: dict[str, object] = {
+            "termination_reason": reason,
+            "process_id": process_id,
+            "process_group_id": group_id,
+            "term_signal": "SIGTERM",
+            "term_grace_seconds": PROCESS_TERMINATION_GRACE_SECONDS,
+            "term_sent": False,
+            "kill_escalated": False,
+            "reap_confirmed": False,
+        }
+        stdout_bytes = b""
+        stderr_bytes = b""
+
+        try:
+            if process.returncode is None and not communicate_task.done():
+                metadata["term_sent"] = self._signal_process_group(process, signal.SIGTERM)
+
+            try:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    asyncio.shield(communicate_task),
+                    timeout=PROCESS_TERMINATION_GRACE_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                metadata["kill_escalated"] = True
+                self._signal_process_group(process, signal.SIGKILL)
+                stdout_bytes, stderr_bytes = await asyncio.shield(communicate_task)
+        finally:
+            # communicate() normally performs the wait itself. The explicit wait
+            # makes the reap guarantee visible and covers stream-task failures.
+            if process.returncode is None:
+                await process.wait()
+            metadata["reap_confirmed"] = process.returncode is not None
+            metadata["final_return_code"] = process.returncode
+
+        self._logger.warning(
+            "Cleaned up CLI '%s' process group %s after %s (kill_escalated=%s, returncode=%s)",
+            self.client.name,
+            group_id,
+            reason,
+            metadata["kill_escalated"],
+            process.returncode,
+        )
+        return stdout_bytes, stderr_bytes, metadata
+
+    def _signal_process_group(self, process: asyncio.subprocess.Process, sig: signal.Signals) -> bool:
+        """Signal the owned group, falling back to the direct process off POSIX."""
+        if process.returncode is not None:
+            return False
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, sig)
+            elif sig == signal.SIGTERM:  # pragma: no cover - exercised on Windows
+                process.terminate()
+            else:  # pragma: no cover - exercised on Windows
+                process.kill()
+            return True
+        except ProcessLookupError:
+            return False
 
     def _build_command(
         self,

@@ -4,8 +4,8 @@
   "additional_args": [
     "--json",
     "--dangerously-bypass-approvals-and-sandbox",
-    "--enable",
-    "web_search_request"
+    "-c",
+    "web_search=\"live\""
   ],
   "env": {},
   "roles": {

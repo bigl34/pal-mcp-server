@@ -2,6 +2,38 @@
 
 <!-- version list -->
 
+## v9.10.2 (2026-08-05)
+
+### Bug Fixes
+
+- Isolate consensus and supervise clink
+  ([`8f12772`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/8f12772c18082ecca6179f5f7b7fd1d6ad002a24))
+
+### Chores
+
+- Restore Entire checkpoint coverage
+  ([`be749ba`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/be749baf60527cde4b3ba3d89b3f1832c63a633f))
+
+- Sync version to config.py [skip ci]
+  ([`c2aaf78`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/c2aaf7869e4d97b254a05f7f5be4ad341f245ce5))
+
+
+## v9.10.1 (2026-08-01)
+
+### Bug Fixes
+
+- **clink**: Replace deprecated codex web-search flag; bound mcp below 2.0
+  ([`f93b7a4`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/f93b7a4a7c233d82151f0472b636377b749e0e27))
+
+### Chores
+
+- Restore Entire checkpoint coverage
+  ([`a047b27`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/a047b277cc29b5d389714e249dabdd555ed961d9))
+
+- Sync version to config.py [skip ci]
+  ([`fc1511f`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/fc1511ff9f20c41a15af70d6eb93d3229b4bd70d))
+
+
 ## v9.10.0 (2026-07-14)
 
 ### Chores

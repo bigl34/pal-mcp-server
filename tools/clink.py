@@ -274,6 +274,7 @@ class CLinkTool(SimpleTool):
         model_info = {
             "provider": client_config.name,
             "model_name": result.parsed.metadata.get("model_used"),
+            "model_metadata": metadata,
         }
 
         if continuation_id:
@@ -367,6 +368,8 @@ class CLinkTool(SimpleTool):
             "model_source": result.model_source,
         }
         metadata.update(result.parsed.metadata)
+        if result.recovery_metadata:
+            metadata["recovery"] = dict(result.recovery_metadata)
         mismatch = self._model_mismatch(result.effective_model, metadata.get("model_used"))
         if mismatch is not None:
             metadata["model_mismatch"] = mismatch

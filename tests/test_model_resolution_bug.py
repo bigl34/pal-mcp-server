@@ -69,9 +69,6 @@ class TestModelResolutionBug:
 
         # Mock the get_model_provider to return our mock
         with patch.object(self.consensus_tool, "get_model_provider", return_value=mock_provider):
-            # Set initial prompt
-            self.consensus_tool.initial_prompt = "Test prompt"
-
             # Create a mock request
             request = Mock()
             request.relevant_files = []
@@ -79,7 +76,13 @@ class TestModelResolutionBug:
             request.images = None
 
             # Test model consultation directly
-            result = asyncio.run(self.consensus_tool._consult_model({"model": "gemini", "stance": "neutral"}, request))
+            result = asyncio.run(
+                self.consensus_tool._consult_model(
+                    {"model": "gemini", "stance": "neutral"},
+                    request,
+                    original_proposal="Test prompt",
+                )
+            )
 
             # Verify that generate_content was called
             assert len(received_model_names) == 1

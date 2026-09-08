@@ -8,6 +8,7 @@ from clink.agents import AgentOutput, CLIAgentError
 from clink.parsers.base import ParsedCLIResponse
 from tools.clink import MAX_RESPONSE_CHARS, CLinkRequest, CLinkTool
 from tools.shared.exceptions import ToolExecutionError
+from utils.conversation_memory import get_thread
 
 
 def test_clink_tool_is_marked_side_effectful():
@@ -82,12 +83,14 @@ def test_registry_lists_roles():
     assert "default" in roles
     assert "default" in registry.list_roles("codex")
     codex_client = registry.get_client("codex")
-    # Verify codex uses --enable web_search_request (not --search which is unsupported by exec)
+    # Verify codex enables live web search via -c web_search="live". The older
+    # --enable web_search_request form was deprecated in codex-cli 0.146.0 (it emits an
+    # error item on every run), and --search is unsupported by `codex exec`.
     assert codex_client.config_args[:4] == [
         "--json",
         "--dangerously-bypass-approvals-and-sandbox",
-        "--enable",
-        "web_search_request",
+        "-c",
+        'web_search="live"',
     ]
     if "-m" in codex_client.config_args:
         model_index = codex_client.config_args.index("-m")
@@ -161,6 +164,56 @@ def test_clink_metadata_unknown_model_mismatch_is_unknown():
     metadata = tool._build_success_metadata(client, role, result)
 
     assert metadata["model_mismatch"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_clink_recovery_metadata_is_surfaced_and_persisted(monkeypatch):
+    tool = CLinkTool()
+
+    class DummyAgent:
+        async def run(self, **kwargs):
+            del kwargs
+            return AgentOutput(
+                parsed=ParsedCLIResponse(content="Recovered Codex result", metadata={"model_used": "gpt-5.5"}),
+                sanitized_command=["codex", "exec", "--json"],
+                returncode=124,
+                stdout='{"type":"item.completed"}',
+                stderr="",
+                duration_seconds=1.5,
+                parser_name="codex_jsonl",
+                recovery_metadata={
+                    "recovered": True,
+                    "reason": "parseable_output_after_nonzero_exit",
+                    "original_return_code": 124,
+                },
+            )
+
+    monkeypatch.setattr("tools.clink.create_agent", lambda client: DummyAgent())
+
+    result = await tool.execute(
+        {
+            "prompt": "Delegate this",
+            "cli_name": "codex",
+            "role": "default",
+            "absolute_file_paths": [],
+            "images": [],
+        }
+    )
+    payload = json.loads(result[0].text)
+
+    expected_recovery = {
+        "recovered": True,
+        "reason": "parseable_output_after_nonzero_exit",
+        "original_return_code": 124,
+    }
+    assert payload["metadata"]["recovery"] == expected_recovery
+
+    continuation_id = payload["continuation_offer"]["continuation_id"]
+    thread = get_thread(continuation_id)
+    assert thread is not None
+    assistant_turn = thread.turns[-1]
+    assert assistant_turn.role == "assistant"
+    assert assistant_turn.model_metadata["recovery"] == expected_recovery
 
 
 @pytest.mark.asyncio

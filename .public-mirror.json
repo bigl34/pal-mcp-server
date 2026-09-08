@@ -2,6 +2,7 @@
   "schema_version": 1,
   "managed_by": "publish-public-repos",
   "item": "pal-mcp-server",
-  "history_policy": "initial-root-only",
-  "actions_policy": "disabled-until-audited"
+  "history_policy": "incremental-only",
+  "actions_policy": "disabled-until-audited",
+  "public_branch": "main"
 }

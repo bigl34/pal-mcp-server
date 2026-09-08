@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from pydantic import Field, model_validator
@@ -29,13 +30,59 @@ from mcp.types import TextContent
 
 from config import TEMPERATURE_ANALYTICAL
 from systemprompts import CONSENSUS_PROMPT
-from tools.shared.base_models import ConsolidatedFindings, WorkflowRequest
+from tools.shared.base_models import WorkflowRequest
+from tools.shared.base_tool import BaseTool
 from utils.client_info import get_current_client_frontend
-from utils.conversation_memory import MAX_CONVERSATION_TURNS, create_thread, get_thread
+from utils.conversation_memory import MAX_CONVERSATION_TURNS, add_turn, create_thread, get_thread
 
 from .workflow.base import WorkflowTool
 
 logger = logging.getLogger(__name__)
+
+CONSENSUS_CHAIN_STATE_KEY = "consensus_chain_state"
+
+
+@dataclass
+class ConsensusChainState:
+    """Mutable state owned by one consensus continuation chain."""
+
+    original_proposal: str
+    models_to_consult: list[dict[str, Any]]
+    relevant_files: list[str] = field(default_factory=list)
+    images: list[str] = field(default_factory=list)
+    accumulated_responses: list[dict[str, Any]] = field(default_factory=list)
+    work_history: list[dict[str, Any]] = field(default_factory=list)
+    host_frontend: str = "unknown"
+    host_skipped_models: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_metadata(self) -> dict[str, Any]:
+        """Return a JSON-serializable snapshot for conversation storage."""
+        return {
+            "version": 1,
+            "original_proposal": self.original_proposal,
+            "models_to_consult": self.models_to_consult,
+            "relevant_files": self.relevant_files,
+            "images": self.images,
+            "accumulated_responses": self.accumulated_responses,
+            "work_history": self.work_history,
+            "host_frontend": self.host_frontend,
+            "host_skipped_models": self.host_skipped_models,
+        }
+
+    @classmethod
+    def from_metadata(cls, metadata: dict[str, Any]) -> ConsensusChainState:
+        """Restore a chain snapshot from conversation storage."""
+        return cls(
+            original_proposal=str(metadata.get("original_proposal") or ""),
+            models_to_consult=list(metadata.get("models_to_consult") or []),
+            relevant_files=list(metadata.get("relevant_files") or []),
+            images=list(metadata.get("images") or []),
+            accumulated_responses=list(metadata.get("accumulated_responses") or []),
+            work_history=list(metadata.get("work_history") or []),
+            host_frontend=str(metadata.get("host_frontend") or "unknown"),
+            host_skipped_models=list(metadata.get("host_skipped_models") or []),
+        )
+
 
 HOST_MODEL_SKIP_ALIASES = {
     "codex": {
@@ -165,14 +212,10 @@ class ConsensusTool(WorkflowTool):
     """
 
     def __init__(self):
-        super().__init__()
-        self.initial_prompt: str | None = None
-        self.original_proposal: str | None = None  # Store the original proposal separately
-        self.models_to_consult: list[dict] = []
-        self.accumulated_responses: list[dict] = []
-        self._current_arguments: dict[str, Any] = {}
-        self.host_model_policy_frontend: str = "unknown"
-        self.host_model_policy_skipped_models: list[dict[str, Any]] = []
+        # Consensus implements its own request-scoped workflow orchestration.
+        # Initializing BaseWorkflowMixin would add singleton chain state to the
+        # registry-owned tool instance, so initialize only BaseTool metadata.
+        BaseTool.__init__(self)
 
     def get_name(self) -> str:
         return "consensus"
@@ -417,16 +460,25 @@ of the evidence, even when it strongly points in one direction.""",
         }
         return step_data
 
-    async def handle_work_completion(self, response_data: dict, request, arguments: dict) -> dict:  # noqa: ARG002
+    async def handle_work_completion(
+        self,
+        response_data: dict,
+        request,
+        arguments: dict,
+        chain_state: ConsensusChainState | None = None,
+    ) -> dict:  # noqa: ARG002
         """Handle consensus workflow completion - no expert analysis, just final synthesis."""
+        chain_state = chain_state or ConsensusChainState(original_proposal=request.step, models_to_consult=[])
         response_data["consensus_complete"] = True
         response_data["status"] = "consensus_workflow_complete"
 
         # Prepare final synthesis data
         response_data["complete_consensus"] = {
-            "initial_prompt": self.original_proposal if self.original_proposal else self.initial_prompt,
-            "models_consulted": [m["model"] + ":" + m.get("stance", "neutral") for m in self.accumulated_responses],
-            "total_responses": len(self.accumulated_responses),
+            "initial_prompt": chain_state.original_proposal,
+            "models_consulted": [
+                m["model"] + ":" + m.get("stance", "neutral") for m in chain_state.accumulated_responses
+            ],
+            "total_responses": len(chain_state.accumulated_responses),
             "consensus_confidence": "high",  # Consensus complete
         }
 
@@ -441,22 +493,34 @@ of the evidence, even when it strongly points in one direction.""",
 
         return response_data
 
-    def handle_work_continuation(self, response_data: dict, request) -> dict:
+    def handle_work_continuation(
+        self,
+        response_data: dict,
+        request,
+        chain_state: ConsensusChainState | None = None,
+    ) -> dict:
         """Handle continuation between consensus steps."""
+        request_models = getattr(request, "models", None)
+        if not isinstance(request_models, list):
+            request_models = []
+        chain_state = chain_state or ConsensusChainState(
+            original_proposal=request.step,
+            models_to_consult=list(request_models),
+        )
         current_idx = request.current_model_index or 0
 
         if request.step_number == 1:
             # After CLI Agent's initial analysis, prepare to consult first model
             response_data["status"] = "consulting_models"
-            response_data["next_model"] = self.models_to_consult[0] if self.models_to_consult else None
+            response_data["next_model"] = chain_state.models_to_consult[0] if chain_state.models_to_consult else None
             response_data["next_steps"] = (
                 "Your initial analysis is complete. The tool will now consult the specified models."
             )
-        elif current_idx < len(self.models_to_consult):
-            next_model = self.models_to_consult[current_idx]
+        elif current_idx < len(chain_state.models_to_consult):
+            next_model = chain_state.models_to_consult[current_idx]
             response_data["status"] = "consulting_next_model"
             response_data["next_model"] = next_model
-            response_data["models_remaining"] = len(self.models_to_consult) - current_idx
+            response_data["models_remaining"] = len(chain_state.models_to_consult) - current_idx
             response_data["next_steps"] = f"Model consultation in progress. Next: {next_model['model']}"
         else:
             response_data["status"] = "ready_for_synthesis"
@@ -466,9 +530,6 @@ of the evidence, even when it strongly points in one direction.""",
 
     async def execute_workflow(self, arguments: dict[str, Any]) -> list:
         """Override execute_workflow to handle model consultations between steps."""
-
-        # Store arguments
-        self._current_arguments = arguments
 
         # Validate request
         request = self.get_workflow_request_model()(**arguments)
@@ -482,8 +543,6 @@ of the evidence, even when it strongly points in one direction.""",
                 skipped_models,
                 frontend,
             ) = self._apply_host_model_skip_policy(request.models or [])
-            self.host_model_policy_frontend = frontend
-            self.host_model_policy_skipped_models = skipped_models
 
             if skipped_models:
                 skipped_labels = ", ".join(item["model"] for item in skipped_models)
@@ -504,33 +563,49 @@ of the evidence, even when it strongly points in one direction.""",
                 continuation_id = create_thread(self.get_name(), clean_args)
                 request.continuation_id = continuation_id
                 arguments["continuation_id"] = continuation_id
-                self.work_history = []
-                self.consolidated_findings = ConsolidatedFindings()
 
-            # Store the original proposal from step 1 - this is what all models should see
-            self.store_initial_issue(request.step)
-            self.initial_request = request.step
-            self.models_to_consult = request.models or []
-            self.accumulated_responses = []
+            chain_state = ConsensusChainState(
+                original_proposal=request.step,
+                models_to_consult=list(request.models or []),
+                relevant_files=list(request.relevant_files or []),
+                images=list(request.images or []),
+                host_frontend=frontend,
+                host_skipped_models=skipped_models,
+            )
             # Set total steps: len(models) (each step includes consultation + response)
-            request.total_steps = len(self.models_to_consult)
+            request.total_steps = len(chain_state.models_to_consult)
+        else:
+            if not continuation_id:
+                raise ValueError(f"Consensus step {request.step_number} requires a continuation_id")
+            chain_state = self._restore_chain_state(continuation_id)
+            if chain_state is None:
+                raise ValueError(
+                    f"Consensus state was not found for continuation_id '{continuation_id}'. "
+                    "Restart the consensus workflow at step 1."
+                )
+            request.total_steps = len(chain_state.models_to_consult)
 
         # For all steps (1 through total_steps), consult the corresponding model
         if request.step_number <= request.total_steps:
             # Calculate which model to consult for this step
             model_idx = request.step_number - 1  # 0-based index
 
-            if model_idx < len(self.models_to_consult):
+            if model_idx < len(chain_state.models_to_consult):
                 # Track workflow state for conversation memory
                 step_data = self.prepare_step_data(request)
-                self.work_history.append(step_data)
-                self._update_consolidated_findings(step_data)
+                chain_state.work_history.append(step_data)
 
                 # Consult the model for this step
-                model_response = await self._consult_model(self.models_to_consult[model_idx], request)
+                model_response = await self._consult_model(
+                    chain_state.models_to_consult[model_idx],
+                    request,
+                    original_proposal=chain_state.original_proposal,
+                    relevant_files=chain_state.relevant_files,
+                    images=chain_state.images,
+                )
 
                 # Add to accumulated responses
-                self.accumulated_responses.append(model_response)
+                chain_state.accumulated_responses.append(model_response)
 
                 # Include the model response in the step data
                 response_data = {
@@ -557,11 +632,11 @@ of the evidence, even when it strongly points in one direction.""",
                     response_data["status"] = "consensus_workflow_complete"
                     response_data["consensus_complete"] = True
                     response_data["complete_consensus"] = {
-                        "initial_prompt": self.original_proposal if self.original_proposal else self.initial_prompt,
+                        "initial_prompt": chain_state.original_proposal,
                         "models_consulted": [
-                            f"{m['model']}:{m.get('stance', 'neutral')}" for m in self.accumulated_responses
+                            f"{m['model']}:{m.get('stance', 'neutral')}" for m in chain_state.accumulated_responses
                         ],
-                        "total_responses": len(self.accumulated_responses),
+                        "total_responses": len(chain_state.accumulated_responses),
                         "consensus_confidence": "high",
                     }
                     response_data["next_steps"] = (
@@ -581,21 +656,22 @@ of the evidence, even when it strongly points in one direction.""",
                     )
 
                 # Add continuation information and workflow customization
-                response_data = self.customize_workflow_response(response_data, request)
+                response_data = self.customize_workflow_response(response_data, request, chain_state)
 
                 # Ensure consensus-specific metadata is attached
                 self._add_workflow_metadata(response_data, arguments)
 
                 if continuation_id:
-                    self.store_conversation_turn(continuation_id, response_data, request)
+                    self._store_chain_turn(continuation_id, response_data, chain_state)
                     continuation_offer = self._build_continuation_offer(continuation_id)
                     if continuation_offer:
                         response_data["continuation_offer"] = continuation_offer
 
                 return [TextContent(type="text", text=json.dumps(response_data, indent=2, ensure_ascii=False))]
 
-        # Otherwise, use standard workflow execution
-        return await super().execute_workflow(arguments)
+        raise ValueError(
+            f"Consensus step_number {request.step_number} exceeds the {request.total_steps} configured model steps"
+        )
 
     def _apply_host_model_skip_policy(self, models: list[dict]) -> tuple[list[dict], list[dict[str, Any]], str]:
         """Remove models that should not be consulted from the current frontend."""
@@ -661,7 +737,53 @@ of the evidence, even when it strongly points in one direction.""",
         except Exception:
             return None
 
-    async def _consult_model(self, model_config: dict, request) -> dict:
+    def _restore_chain_state(self, continuation_id: str) -> ConsensusChainState | None:
+        """Restore only the state belonging to the requested continuation."""
+        thread = get_thread(continuation_id)
+        if not thread:
+            return None
+
+        for turn in reversed(thread.turns):
+            if turn.role != "assistant" or turn.tool_name != self.get_name() or not turn.model_metadata:
+                continue
+            stored_state = turn.model_metadata.get(CONSENSUS_CHAIN_STATE_KEY)
+            if isinstance(stored_state, dict):
+                return ConsensusChainState.from_metadata(stored_state)
+        return None
+
+    def _store_chain_turn(
+        self,
+        continuation_id: str,
+        response_data: dict[str, Any],
+        chain_state: ConsensusChainState,
+    ) -> None:
+        """Persist a chain snapshot without touching the singleton tool instance."""
+        clean_content = self._extract_clean_workflow_content_for_history(response_data)
+        state_metadata = chain_state.to_metadata()
+        add_turn(
+            thread_id=continuation_id,
+            role="assistant",
+            content=clean_content,
+            tool_name=self.get_name(),
+            files=list(chain_state.relevant_files),
+            images=list(chain_state.images),
+            model_metadata={
+                CONSENSUS_CHAIN_STATE_KEY: state_metadata,
+                # Preserve the generic workflow keys for existing conversation tooling.
+                "work_history": state_metadata["work_history"],
+                "initial_request": state_metadata["original_proposal"],
+            },
+        )
+
+    async def _consult_model(
+        self,
+        model_config: dict,
+        request,
+        *,
+        original_proposal: str | None = None,
+        relevant_files: list[str] | None = None,
+        images: list[str] | None = None,
+    ) -> dict:
         """Consult a single model and return its response."""
         try:
             # Import and create ModelContext once at the beginning
@@ -679,10 +801,11 @@ of the evidence, even when it strongly points in one direction.""",
             # original prompt + files, not conversation history or other model responses
             # CRITICAL: Use the original proposal from step 1, NOT what's in request.step for steps 2+!
             # Steps 2+ contain summaries/notes that must NEVER be sent to other models
-            prompt = self.original_proposal if self.original_proposal else self.initial_prompt
-            if request.relevant_files:
+            prompt = original_proposal or request.step
+            files_for_consultation = relevant_files if relevant_files is not None else request.relevant_files
+            if files_for_consultation:
                 file_content, _ = self._prepare_file_content_for_prompt(
-                    request.relevant_files,
+                    files_for_consultation,
                     None,  # Use None instead of request.continuation_id for blinded consensus
                     "Context files",
                     model_context=model_context,
@@ -715,7 +838,7 @@ of the evidence, even when it strongly points in one direction.""",
                 system_prompt=system_prompt,
                 temperature=validated_temperature,
                 thinking_mode="medium",
-                images=request.images if request.images else None,
+                images=images if images is not None else (request.images if request.images else None),
             )
 
             response_metadata = response.metadata if isinstance(response.metadata, dict) else {}
@@ -821,11 +944,16 @@ of the evidence, even when it strongly points in one direction.""",
         stance_prompt = stance_prompts.get(stance, stance_prompts["neutral"])
         return base_prompt.replace("{stance_prompt}", stance_prompt)
 
-    def customize_workflow_response(self, response_data: dict, request) -> dict:
+    def customize_workflow_response(
+        self,
+        response_data: dict,
+        request,
+        chain_state: ConsensusChainState | None = None,
+    ) -> dict:
         """Customize response for consensus workflow."""
         # Store model responses in the response for tracking
-        if self.accumulated_responses:
-            response_data["accumulated_responses"] = self.accumulated_responses
+        if chain_state and chain_state.accumulated_responses:
+            response_data["accumulated_responses"] = chain_state.accumulated_responses
 
         # Add consensus-specific fields
         if request.step_number == 1:
@@ -836,11 +964,16 @@ of the evidence, even when it strongly points in one direction.""",
             response_data["consensus_workflow_status"] = "ready_for_synthesis"
 
         # Customize metadata for consensus workflow
-        self._customize_consensus_metadata(response_data, request)
+        self._customize_consensus_metadata(response_data, request, chain_state)
 
         return response_data
 
-    def _customize_consensus_metadata(self, response_data: dict, request) -> None:
+    def _customize_consensus_metadata(
+        self,
+        response_data: dict,
+        request,
+        chain_state: ConsensusChainState | None = None,
+    ) -> None:
         """
         Customize metadata for consensus workflow to accurately reflect multi-model nature.
 
@@ -855,23 +988,23 @@ of the evidence, even when it strongly points in one direction.""",
 
         # Always preserve tool_name
         metadata["tool_name"] = self.get_name()
-        metadata["host_frontend"] = self.host_model_policy_frontend
+        metadata["host_frontend"] = chain_state.host_frontend if chain_state else "unknown"
 
-        if self.host_model_policy_skipped_models:
-            metadata["models_skipped_by_host_policy"] = self.host_model_policy_skipped_models
+        if chain_state and chain_state.host_skipped_models:
+            metadata["models_skipped_by_host_policy"] = chain_state.host_skipped_models
 
         if request.step_number == request.total_steps:
             # Final step - show comprehensive consensus metadata
             models_consulted = []
-            if self.models_to_consult:
-                models_consulted = [f"{m['model']}:{m.get('stance', 'neutral')}" for m in self.models_to_consult]
+            if chain_state and chain_state.models_to_consult:
+                models_consulted = [f"{m['model']}:{m.get('stance', 'neutral')}" for m in chain_state.models_to_consult]
 
             metadata.update(
                 {
                     "workflow_type": "multi_model_consensus",
                     "models_consulted": models_consulted,
                     "consensus_complete": True,
-                    "total_models": len(self.models_to_consult) if self.models_to_consult else 0,
+                    "total_models": len(chain_state.models_to_consult) if chain_state else 0,
                 }
             )
 
@@ -882,8 +1015,10 @@ of the evidence, even when it strongly points in one direction.""",
         else:
             # Intermediate steps - show consensus workflow in progress
             models_to_consult = []
-            if self.models_to_consult:
-                models_to_consult = [f"{m['model']}:{m.get('stance', 'neutral')}" for m in self.models_to_consult]
+            if chain_state and chain_state.models_to_consult:
+                models_to_consult = [
+                    f"{m['model']}:{m.get('stance', 'neutral')}" for m in chain_state.models_to_consult
+                ]
 
             metadata.update(
                 {
@@ -922,11 +1057,6 @@ of the evidence, even when it strongly points in one direction.""",
         logger.debug(
             f"[CONSENSUS_METADATA] {self.get_name()}: Using consensus-specific metadata instead of single-model metadata"
         )
-
-    def store_initial_issue(self, step_description: str):
-        """Store initial prompt for model consultations."""
-        self.original_proposal = step_description
-        self.initial_prompt = step_description  # Keep for backward compatibility
 
     # Required abstract methods from BaseTool
     def get_request_model(self):
