@@ -56,11 +56,24 @@ class CustomModelRegistryBase:
         self.alias_map: dict[str, str] = {}
         self.model_map: dict[str, ModelCapabilities] = {}
         self._extras: dict[str, dict] = {}
+        self.load_failed = False
 
     def reload(self) -> None:
         data = self._load_config_data()
+        settings = self._parse_settings(data)
         configs = [config for config in self._parse_models(data) if config is not None]
         self._build_maps(configs)
+        self._apply_settings(settings)
+
+    def _parse_settings(self, data: dict) -> object | None:
+        """Hook for registries that validate top-level settings beside ``models``."""
+
+        return None
+
+    def _apply_settings(self, settings: object | None) -> None:
+        """Hook that commits validated settings once the model maps are rebuilt."""
+
+        return None
 
     def list_models(self) -> list[str]:
         return list(self.model_map.keys())
@@ -98,6 +111,11 @@ class CustomModelRegistryBase:
     # Internal helpers
     # ------------------------------------------------------------------
     def _load_config_data(self) -> dict:
+        data = self._read_config_data()
+        self.load_failed = data is None
+        return data or {"models": []}
+
+    def _read_config_data(self) -> dict | None:
         if self._use_resources:
             try:
                 resource = importlib.resources.files(self._resource_package).joinpath(self._default_filename)
@@ -106,14 +124,13 @@ class CustomModelRegistryBase:
                 else:  # pragma: no cover - legacy Python fallback
                     with resource.open("r", encoding="utf-8") as handle:
                         config_text = handle.read()
-                data = json.loads(config_text)
+                return json.loads(config_text)
             except FileNotFoundError:
                 logger.debug("Packaged %s not found", self._default_filename)
-                return {"models": []}
+                return None
             except Exception as exc:
                 logger.warning("Failed to read packaged %s: %s", self._default_filename, exc)
-                return {"models": []}
-            return data or {"models": []}
+                return None
 
         if not self.config_path:
             raise FileNotFoundError("Registry configuration path is not set")
@@ -126,12 +143,11 @@ class CustomModelRegistryBase:
                     logger.debug("Falling back to %s", fallback)
                     self.config_path = fallback
                 else:
-                    return {"models": []}
+                    return None
             else:
-                return {"models": []}
+                return None
 
-        data = read_json_file(str(self.config_path))
-        return data or {"models": []}
+        return read_json_file(str(self.config_path))
 
     @property
     def use_resources(self) -> bool:

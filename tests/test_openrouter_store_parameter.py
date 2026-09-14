@@ -906,5 +906,290 @@ class TestOpenRouterNonZdrException(unittest.TestCase):
         )
 
 
+def _write_openrouter_config(directory, provider_preferences=None):
+    config = {
+        "models": [
+            {
+                "model_name": "openrouter/fusion",
+                "aliases": ["fusion"],
+                "context_window": 128000,
+                "max_output_tokens": 128000,
+                "supports_temperature": False,
+                "temperature_constraint": "fixed",
+                "allow_non_zdr": True,
+            },
+            {
+                "model_name": "anthropic/claude-fable-5",
+                "aliases": ["fable-5"],
+                "context_window": 1000000,
+                "max_output_tokens": 128000,
+                "supports_temperature": False,
+                "temperature_constraint": "fixed",
+                "allow_non_zdr": True,
+            },
+            {
+                "model_name": "z-ai/glm-5.3",
+                "aliases": ["glm"],
+                "context_window": 200000,
+                "max_output_tokens": 65536,
+            },
+        ],
+    }
+    if provider_preferences is not None:
+        config["provider_preferences"] = provider_preferences
+    config_path = Path(directory) / "openrouter_models.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    return config_path
+
+
+def _chat_capture(captured_params):
+    def capture_create(**kwargs):
+        captured_params.update(kwargs)
+        mock_message = Mock()
+        mock_message.content = "Test response"
+        mock_choice = Mock()
+        mock_choice.message = mock_message
+        mock_choice.finish_reason = "stop"
+        mock_response = Mock()
+        mock_response.choices = [mock_choice]
+        mock_response.usage = None
+        mock_response.model = kwargs["model"]
+        mock_response.id = "chatcmpl-test"
+        mock_response.created = 123
+        return mock_response
+
+    mock_client_instance = Mock()
+    mock_client_instance.chat.completions.create = capture_create
+    return mock_client_instance
+
+
+class TestOpenRouterIgnoredProviders(unittest.TestCase):
+    """Top-level provider_preferences.ignore becomes OpenRouter provider.ignore."""
+
+    IGNORE = ["novita", "alibaba", "seed"]
+
+    def setUp(self):
+        self.original_registry = OpenRouterProvider._registry
+        self.original_restriction_service = utils.model_restrictions._restriction_service
+        utils.model_restrictions._restriction_service = None
+
+    def tearDown(self):
+        OpenRouterProvider._registry = self.original_registry
+        utils.model_restrictions._restriction_service = self.original_restriction_service
+
+    def configure_registry(self, temp_dir, provider_preferences=None):
+        config_path = _write_openrouter_config(temp_dir, provider_preferences)
+        OpenRouterProvider._registry = OpenRouterModelRegistry(config_path=str(config_path))
+        return OpenRouterProvider._registry
+
+    def generate_chat(self, temp_dir, model_name, provider_preferences):
+        captured_params = {}
+        mock_client_instance = _chat_capture(captured_params)
+        self.configure_registry(temp_dir, provider_preferences)
+        with patch.object(
+            OpenRouterProvider,
+            "client",
+            new_callable=lambda: property(lambda self: mock_client_instance),
+        ):
+            provider = OpenRouterProvider("test-key")
+            provider.generate_content("test", model_name=model_name)
+        return captured_params
+
+    def test_registry_parses_ignore_list_stripped_and_deduped(self):
+        with TemporaryDirectory() as temp_dir:
+            registry = self.configure_registry(
+                temp_dir,
+                {"ignore": [" novita ", "alibaba", "novita", "seed"]},
+            )
+
+        self.assertEqual(registry.ignored_providers, ["novita", "alibaba", "seed"])
+
+    def test_registry_ignored_providers_returns_copy(self):
+        with TemporaryDirectory() as temp_dir:
+            registry = self.configure_registry(temp_dir, {"ignore": self.IGNORE})
+
+        registry.ignored_providers.append("mutated")
+
+        self.assertEqual(registry.ignored_providers, self.IGNORE)
+
+    def test_registry_without_block_has_empty_ignore_list(self):
+        with TemporaryDirectory() as temp_dir:
+            registry = self.configure_registry(temp_dir)
+
+        self.assertEqual(registry.ignored_providers, [])
+
+    def test_registry_rejects_non_dict_provider_preferences(self):
+        with TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(ValueError, "provider_preferences"):
+                self.configure_registry(temp_dir, ["novita"])
+
+    def test_registry_rejects_explicit_null_provider_preferences(self):
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "openrouter_models.json"
+            config_path.write_text(json.dumps({"provider_preferences": None, "models": []}), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "provider_preferences"):
+                OpenRouterModelRegistry(config_path=str(config_path))
+
+    def test_registry_marks_missing_config_as_load_failure(self):
+        registry = OpenRouterModelRegistry(config_path="/non/existent/openrouter_models.json")
+
+        self.assertTrue(registry.load_failed)
+
+    def test_registry_marks_invalid_json_as_load_failure(self):
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "openrouter_models.json"
+            config_path.write_text("{ invalid json }", encoding="utf-8")
+            registry = OpenRouterModelRegistry(config_path=str(config_path))
+
+        self.assertTrue(registry.load_failed)
+
+    def test_registry_marks_valid_config_as_loaded(self):
+        with TemporaryDirectory() as temp_dir:
+            registry = self.configure_registry(temp_dir)
+
+        self.assertFalse(registry.load_failed)
+
+    def test_provider_refuses_requests_when_config_failed_to_load(self):
+        OpenRouterProvider._registry = OpenRouterModelRegistry(config_path="/non/existent/openrouter_models.json")
+        provider = OpenRouterProvider("test-key")
+
+        with self.assertRaisesRegex(RuntimeError, "provider blocklist"):
+            provider._provider_request_options("z-ai/glm-5.3")
+
+    def test_failed_reload_preserves_previous_blocklist(self):
+        with TemporaryDirectory() as temp_dir:
+            registry = self.configure_registry(temp_dir, {"ignore": self.IGNORE})
+            broken_config = {
+                "models": [{"model_name": "broken/model", "max_tokens": 1}],
+            }
+            registry.config_path.write_text(json.dumps(broken_config), encoding="utf-8")
+
+            with self.assertRaises(ValueError):
+                registry.reload()
+
+        self.assertEqual(registry.ignored_providers, self.IGNORE)
+        self.assertEqual(registry.resolve("glm").model_name, "z-ai/glm-5.3")
+
+    def test_successful_reload_without_block_clears_blocklist(self):
+        with TemporaryDirectory() as temp_dir:
+            registry = self.configure_registry(temp_dir, {"ignore": self.IGNORE})
+            _write_openrouter_config(temp_dir)
+
+            registry.reload()
+
+        self.assertEqual(registry.ignored_providers, [])
+
+    def test_registry_rejects_non_list_ignore(self):
+        with TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(ValueError, "ignore"):
+                self.configure_registry(temp_dir, {"ignore": "novita"})
+
+    def test_registry_rejects_non_string_ignore_entries(self):
+        with TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(ValueError, "ignore"):
+                self.configure_registry(temp_dir, {"ignore": ["novita", 42]})
+
+    def test_registry_rejects_blank_ignore_entries(self):
+        with TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(ValueError, "ignore"):
+                self.configure_registry(temp_dir, {"ignore": ["novita", "  "]})
+
+    def test_registry_rejects_unknown_provider_preference_keys(self):
+        with TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(ValueError, "order"):
+                self.configure_registry(temp_dir, {"ignore": ["novita"], "order": ["together"]})
+
+    def test_chat_completions_include_ignore_with_zdr(self):
+        with TemporaryDirectory() as temp_dir:
+            captured_params = self.generate_chat(temp_dir, "glm", {"ignore": self.IGNORE})
+
+        self.assertEqual(
+            captured_params.get("extra_body"),
+            {"provider": {"data_collection": "deny", "zdr": True, "ignore": self.IGNORE}},
+        )
+        self.assertNotIn("tool_choice", captured_params)
+
+    def test_chat_completions_omit_ignore_when_list_empty(self):
+        with TemporaryDirectory() as temp_dir:
+            captured_params = self.generate_chat(temp_dir, "glm", {"ignore": []})
+
+        self.assertEqual(
+            captured_params.get("extra_body"),
+            {"provider": {"data_collection": "deny", "zdr": True}},
+        )
+
+    def test_allow_non_zdr_model_keeps_ignore_without_zdr(self):
+        with TemporaryDirectory() as temp_dir:
+            captured_params = self.generate_chat(temp_dir, "fable-5", {"ignore": self.IGNORE})
+
+        self.assertEqual(
+            captured_params.get("extra_body"),
+            {"provider": {"data_collection": "deny", "ignore": self.IGNORE}},
+        )
+
+    def test_fusion_keeps_ignore_and_forced_tool_choice(self):
+        with TemporaryDirectory() as temp_dir:
+            captured_params = self.generate_chat(temp_dir, "fusion", {"ignore": self.IGNORE})
+
+        self.assertEqual(
+            captured_params.get("extra_body"),
+            {"provider": {"data_collection": "deny", "ignore": self.IGNORE}},
+        )
+        self.assertEqual(captured_params.get("tool_choice"), "required")
+
+    def test_responses_endpoint_includes_ignore(self):
+        captured_params = {}
+
+        def capture_create(**kwargs):
+            captured_params.update(kwargs)
+            mock_response = Mock()
+            mock_response.output_text = "Test response"
+            mock_response.usage = None
+            return mock_response
+
+        mock_client_instance = Mock()
+        mock_client_instance.responses.create = capture_create
+
+        with TemporaryDirectory() as temp_dir:
+            self.configure_registry(temp_dir, {"ignore": self.IGNORE})
+            with patch.object(
+                OpenRouterProvider,
+                "client",
+                new_callable=lambda: property(lambda self: mock_client_instance),
+            ):
+                provider = OpenRouterProvider("test-key")
+                provider._generate_with_responses_endpoint(
+                    model_name="z-ai/glm-5.3",
+                    messages=[{"role": "user", "content": "test"}],
+                    temperature=0.7,
+                )
+
+        self.assertEqual(
+            captured_params.get("extra_body"),
+            {"provider": {"data_collection": "deny", "zdr": True, "ignore": self.IGNORE}},
+        )
+
+    def test_base_provider_default_hook_omits_ignore(self):
+        provider = MockOpenRouterProvider("test-key")
+
+        options = provider._provider_request_options("openai/gpt-5-pro")
+
+        self.assertEqual(options, {"extra_body": {"provider": {"data_collection": "deny", "zdr": True}}})
+
+    def test_base_provider_hook_override_adds_ignore(self):
+        class BlocklistedProvider(MockOpenRouterProvider):
+            def _openrouter_ignored_providers(self):
+                return ["novita"]
+
+        provider = BlocklistedProvider("test-key")
+
+        options = provider._provider_request_options("openai/gpt-5-pro")
+
+        self.assertEqual(
+            options,
+            {"extra_body": {"provider": {"data_collection": "deny", "zdr": True, "ignore": ["novita"]}}},
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

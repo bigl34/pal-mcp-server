@@ -2,6 +2,52 @@
 
 <!-- version list -->
 
+## v9.11.0 (2026-09-11)
+
+### Chores
+
+- Restore Entire checkpoint coverage
+  ([`14ca723`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/14ca723d45c2e798fff03cf8f4b061e0f7647d69))
+
+- Sync version to config.py [skip ci]
+  ([`c082c6d`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/c082c6da4b5b2c0712b011c91c83fc41decef0fd))
+
+### Features
+
+- **openrouter**: Send configured provider blocklist as provider.ignore
+  ([`4e1c932`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/4e1c932a4c00edc8ca16353a51acae9ca821dc3f))
+
+
+## v9.10.3 (2026-09-08)
+
+### Bug Fixes
+
+- **ci**: Restore Ruff import formatting [Autofix GH Workflow]
+  ([`9b22b71`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/9b22b712ef12ead9d1b7902432a829eae5519704))
+
+### Chores
+
+- Refresh Entire agent hooks
+  ([`ea7d07c`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/ea7d07c2422151ffb420a98dfddf46d8e46f8d73))
+
+- Refresh Entire Claude Code hooks
+  ([`d7100d4`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/d7100d40989091893334241bae09e5d82eda1a16))
+
+- Restore Entire checkpoint coverage
+  ([`e2ec539`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/e2ec53913bcc89fe88c6c870e57f822456de0091))
+
+- Sync version to config.py [skip ci]
+  ([`778a617`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/778a617cf404e68b79a900e76750dfba78d16fc4))
+
+- Sync version to config.py [skip ci]
+  ([`b4e8679`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/b4e86790816d77229faab25ff427375ca833598e))
+
+### Continuous Integration
+
+- Grant Entire caller PR read access [Autofix GH Workflow]
+  ([`05dc4d8`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/05dc4d80fdbd5fe4b4d00b74f1c6e81fbb602f3b))
+
+
 ## v9.10.2 (2026-08-05)
 
 ### Bug Fixes

@@ -315,6 +315,24 @@ rules rather than dropping unrelated models.
 
 **Important:** Keep OpenRouter and Custom models in their respective files so that requests are routed correctly.
 
+#### OpenRouter Provider Blocklist
+
+`openrouter_models.json` may carry a top-level `provider_preferences` block
+beside `models`. Its `ignore` list holds OpenRouter provider slugs (as returned
+by `GET /api/v1/providers`) that every request excludes via the body-level
+`provider.ignore` field, alongside the default `data_collection: "deny"` and
+`zdr: true` routing (models flagged `allow_non_zdr` omit only `zdr`):
+
+```json
+{
+  "provider_preferences": { "ignore": ["novita", "alibaba"] },
+  "models": [ ... ]
+}
+```
+
+Only `ignore` is supported; other keys raise at startup. OpenRouter merges this
+list with the account-wide ignored providers, so it can only add exclusions.
+
 ## Available Models
 
 Popular models available through OpenRouter:

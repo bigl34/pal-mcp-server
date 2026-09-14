@@ -136,13 +136,21 @@ class OpenRouterProvider(OpenAICompatibleProvider):
         resolved_model = config.model_name if config else model_name
         return resolved_model.lower() == "openrouter/fusion"
 
+    def _openrouter_ignored_providers(self) -> list[str]:
+        """Read the configured provider blocklist from the registry."""
+
+        if not self._registry:
+            return []
+        if self._registry.load_failed:
+            raise RuntimeError(
+                "OpenRouter model configuration failed to load; refusing to route without the provider blocklist"
+            )
+        return self._registry.ignored_providers
+
     def _provider_request_options(self, model_name: str | None = None) -> dict:
         """Apply OpenRouter data-policy routing preferences for this model."""
 
-        provider_preferences = {"data_collection": "deny"}
-        if not self._allow_openrouter_non_zdr(model_name):
-            provider_preferences["zdr"] = True
-        options = {"extra_body": {"provider": provider_preferences}}
+        options = super()._provider_request_options(model_name)
 
         if self._is_fusion_model(model_name):
             options["tool_choice"] = "required"

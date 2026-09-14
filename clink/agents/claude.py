@@ -6,8 +6,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from clink.models import ResolvedCLIRole
-from clink.parsers.base import ParsedCLIResponse
-from clink.parsers.base import ParserError
+from clink.parsers.base import ParsedCLIResponse, ParserError
 
 from .base import AgentOutput, BaseCLIAgent, CLIAgentError, ModelResolution
 

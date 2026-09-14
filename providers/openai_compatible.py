@@ -394,6 +394,9 @@ class OpenAICompatibleProvider(ModelProvider):
             provider_preferences = {"data_collection": "deny"}
             if not self._allow_openrouter_non_zdr(model_name):
                 provider_preferences["zdr"] = True
+            ignored_providers = self._openrouter_ignored_providers()
+            if ignored_providers:
+                provider_preferences["ignore"] = list(ignored_providers)
             return {"extra_body": {"provider": provider_preferences}}
         return {}
 
@@ -401,6 +404,11 @@ class OpenAICompatibleProvider(ModelProvider):
         """Return True when a configured OpenRouter model may bypass strict ZDR."""
 
         return False
+
+    def _openrouter_ignored_providers(self) -> list[str]:
+        """Return provider slugs to exclude from OpenRouter routing."""
+
+        return []
 
     @staticmethod
     def _to_responses_content(content, role: str) -> list:
