@@ -45,6 +45,7 @@ class TestConsensusWorkflowAccurate(ConversationBaseTest):
                 {
                     "step": "Should we add a new AI-powered search feature to our application? Please analyze the technical feasibility, user value, and implementation complexity.",
                     "step_number": 1,
+                    "mode": "sequential",
                     "total_steps": 2,  # 2 models (each step includes consultation + analysis)
                     "next_step_required": True,
                     "findings": "Initial assessment of AI search feature proposal considering user needs, technical constraints, and business value.",

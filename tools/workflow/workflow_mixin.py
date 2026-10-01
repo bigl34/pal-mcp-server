@@ -265,9 +265,15 @@ class BaseWorkflowMixin(ABC):
     def get_request_thinking_mode(self, request) -> str:
         """Get thinking mode from request. Override for custom thinking mode handling."""
         try:
-            return request.thinking_mode if request.thinking_mode is not None else self.get_expert_thinking_mode()
+            request_value = request.thinking_mode
         except AttributeError:
-            return self.get_expert_thinking_mode()
+            request_value = None
+        model_context = getattr(self, "_model_context", None)
+        try:
+            capabilities = getattr(model_context, "capabilities", None)
+        except Exception:
+            capabilities = None
+        return self.resolve_thinking_mode(request_value, capabilities, self.get_expert_thinking_mode())
 
     def get_expert_analysis_instruction(self) -> str:
         """

@@ -13,6 +13,7 @@ capabilities from BaseTool.
 """
 
 import asyncio
+import contextvars
 from abc import abstractmethod
 from typing import Any, Optional
 
@@ -20,6 +21,8 @@ from tools.shared.base_models import ToolRequest
 from tools.shared.base_tool import BaseTool
 from tools.shared.exceptions import ToolExecutionError
 from tools.shared.schema_builders import SchemaBuilder
+
+_ACTIVE_CLI_SEAT: contextvars.ContextVar = contextvars.ContextVar("pal_active_cli_seat", default=None)
 
 
 class SimpleTool(BaseTool):
@@ -313,6 +316,10 @@ class SimpleTool(BaseTool):
 
             # Store the current model name for later use
             self._current_model_name = model_name
+            self._active_cli_seat = self.resolve_cli_seat(model_name)
+            if self._active_cli_seat is not None:
+                self.validate_cli_seat_request(request, self._active_cli_seat)
+            context_model_name = self._active_cli_seat.fallback_model if self._active_cli_seat else model_name
 
             # Handle model context from arguments (for in-process testing)
             if "_model_context" in arguments:
@@ -322,8 +329,8 @@ class SimpleTool(BaseTool):
                 # Create model context if not provided
                 from utils.model_context import ModelContext
 
-                self._model_context = ModelContext(model_name)
-                logger.debug(f"{self.get_name()}: Created model context for {model_name}")
+                self._model_context = ModelContext(context_model_name)
+                logger.debug(f"{self.get_name()}: Created model context for {context_model_name}")
 
             # Get images if present
             images = self.get_request_images(request)
@@ -380,11 +387,12 @@ class SimpleTool(BaseTool):
                 # New conversation, prepare prompt normally
                 prompt = await self.prepare_prompt(request)
 
-                # Add follow-up instructions for new conversations
-                from server import get_follow_up_instructions
+                # Add follow-up instructions for new conversations; single-shot CLI seats get none
+                if self._active_cli_seat is None:
+                    from server import get_follow_up_instructions
 
-                follow_up_instructions = get_follow_up_instructions(0)
-                prompt = f"{prompt}\n\n{follow_up_instructions}"
+                    follow_up_instructions = get_follow_up_instructions(0)
+                    prompt = f"{prompt}\n\n{follow_up_instructions}"
                 logger.debug(
                     f"Added follow-up instructions for new {self.get_name()} conversation"
                 )  # Validate images if any were provided
@@ -408,15 +416,14 @@ class SimpleTool(BaseTool):
 
             # Log any temperature corrections
             for warning in temp_warnings:
-                # Get thinking mode with defaults
                 logger.warning(warning)
-            thinking_mode = self.get_request_thinking_mode(request)
-            if thinking_mode is None:
-                thinking_mode = self.get_default_thinking_mode()
-
             # Get the provider from model context (clean OOP - no re-fetching)
             provider = self._model_context.provider
             capabilities = self._model_context.capabilities
+            # Get thinking mode with defaults
+            thinking_mode = self.resolve_thinking_mode(
+                self.get_request_thinking_mode(request), capabilities, self.get_default_thinking_mode()
+            )
 
             # Get system prompt for this tool
             base_system_prompt = self.get_system_prompt()
@@ -441,13 +448,10 @@ class SimpleTool(BaseTool):
             # Resolve model capabilities for feature gating
             supports_thinking = capabilities.supports_extended_thinking
 
-            # Generate content with provider abstraction.
-            # Sync SDK call wrapped in asyncio.to_thread so a blocked HTTP
-            # read cannot freeze the event loop — see FORK.md.
-            model_response = await asyncio.to_thread(
-                provider.generate_content,
+            model_response = await self.generate_model_response(
+                request=request,
+                provider=provider,
                 prompt=prompt,
-                model_name=self._current_model_name,
                 system_prompt=system_prompt,
                 temperature=temperature,
                 thinking_mode=thinking_mode if supports_thinking else None,
@@ -593,6 +597,45 @@ class SimpleTool(BaseTool):
                 content_type="text",
             )
             raise ToolExecutionError(error_output.model_dump_json()) from e
+
+    @property
+    def _active_cli_seat(self):
+        """CLI seat for the in-flight call; per-task so concurrent calls on the shared tool cannot clobber it."""
+        return _ACTIVE_CLI_SEAT.get()
+
+    @_active_cli_seat.setter
+    def _active_cli_seat(self, seat) -> None:
+        _ACTIVE_CLI_SEAT.set(seat)
+
+    def resolve_cli_seat(self, model_name: Optional[str]):
+        """Return the CLI seat named by ``model_name`` when this tool can route to seats."""
+        return None
+
+    def validate_cli_seat_request(self, request, seat) -> None:
+        """Reject request features a CLI seat cannot honour."""
+        return None
+
+    async def generate_model_response(
+        self,
+        *,
+        request,
+        provider,
+        prompt: str,
+        system_prompt: str,
+        temperature: float,
+        thinking_mode: Optional[str],
+        images: Optional[list],
+    ):
+        """Produce the model response; sync SDK call wrapped in asyncio.to_thread (see FORK.md)."""
+        return await asyncio.to_thread(
+            provider.generate_content,
+            prompt=prompt,
+            model_name=self._current_model_name,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            thinking_mode=thinking_mode,
+            images=images,
+        )
 
     def _parse_response(self, raw_text: str, request, model_info: Optional[dict] = None):
         """

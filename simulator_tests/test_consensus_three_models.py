@@ -29,6 +29,7 @@ class TestConsensusThreeModels(BaseSimulatorTest):
                 {
                     "step": "Is a sync manager class a good idea for my CoolTodos app?",
                     "step_number": 1,
+                    "mode": "sequential",
                     "total_steps": 3,  # 3 models = 3 steps
                     "next_step_required": True,
                     "findings": "Initial analysis needed on sync manager class architecture decision for CoolTodos app",

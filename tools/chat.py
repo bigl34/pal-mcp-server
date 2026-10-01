@@ -6,9 +6,13 @@ brainstorming, problem-solving, and collaborative thinking. It supports file con
 images, and conversation continuation for seamless multi-turn interactions.
 """
 
+import asyncio
+import contextvars
+import dataclasses
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -19,10 +23,31 @@ if TYPE_CHECKING:
     from tools.models import ToolModelCategory
 
 from config import TEMPERATURE_BALANCED
+from providers.shared import ModelResponse
 from systemprompts import CHAT_PROMPT, GENERATE_CODE_PROMPT
+from tools.consensus_cli_seats import (
+    CLI_ADVISOR_HEADER,
+    CLI_ADVISOR_INSTRUCTION,
+    CLI_ADVISOR_INSTRUCTIONS_HEADER,
+    CLISeat,
+    CLISeatConfigError,
+    consult_seat_with_fallback,
+    describe_exception,
+    effort_for_thinking_mode,
+    get_cli_seat_state,
+    load_cli_seats,
+)
 from tools.shared.base_models import COMMON_FIELD_DESCRIPTIONS, ToolRequest
+from utils.client_info import get_current_client_frontend
 
 from .simple.base import SimpleTool
+
+CHAT_SEAT_DEADLINE_S = 1440.0
+CHAT_SEAT_CLI_TIMEOUT_S = 600.0
+CHAT_SEAT_QUEUE_WAIT_S = 60.0
+CHAT_SEAT_DEFAULT_EFFORT = "high"
+
+_SEAT_METADATA: contextvars.ContextVar = contextvars.ContextVar("pal_chat_seat_metadata", default=None)
 
 # Field descriptions matching the original Chat tool exactly
 CHAT_FIELD_DESCRIPTIONS = {
@@ -69,6 +94,14 @@ class ChatTool(SimpleTool):
         super().__init__()
         self._last_recordable_response: Optional[str] = None
 
+    @property
+    def _seat_metadata(self) -> Optional[dict[str, Any]]:
+        return _SEAT_METADATA.get()
+
+    @_seat_metadata.setter
+    def _seat_metadata(self, metadata: Optional[dict[str, Any]]) -> None:
+        _SEAT_METADATA.set(metadata)
+
     def get_name(self) -> str:
         return "chat"
 
@@ -88,7 +121,7 @@ class ChatTool(SimpleTool):
 
     def get_capability_system_prompts(self, capabilities: Optional["ModelCapabilities"]) -> list[str]:
         prompts = list(super().get_capability_system_prompts(capabilities))
-        if capabilities and capabilities.allow_code_generation:
+        if self._active_cli_seat is None and capabilities and capabilities.allow_code_generation:
             prompts.append(GENERATE_CODE_PROMPT)
         return prompts
 
@@ -135,7 +168,7 @@ class ChatTool(SimpleTool):
                     "type": "string",
                     "description": CHAT_FIELD_DESCRIPTIONS["working_directory_absolute_path"],
                 },
-                "model": self.get_model_field_schema(),
+                "model": self._model_field_schema_with_seats(),
                 "temperature": {
                     "type": "number",
                     "description": COMMON_FIELD_DESCRIPTIONS["temperature"],
@@ -156,6 +189,22 @@ class ChatTool(SimpleTool):
             "additionalProperties": False,
         }
 
+        return schema
+
+    def _model_field_schema_with_seats(self) -> dict[str, Any]:
+        schema = dict(self.get_model_field_schema())
+        try:
+            registry = load_cli_seats()
+        except CLISeatConfigError:
+            return schema
+        if not registry.seats:
+            return schema
+        seat_names = ", ".join(seat.name for seat in registry.seats)
+        schema["description"] = (
+            f"{schema.get('description', '')} Subscription CLI seats ({seat_names}) are also accepted: single-shot, "
+            "prompt-only, effort from thinking_mode (default high), API fallback to the seat's fallback model; "
+            "no continuation_id or images."
+        ).strip()
         return schema
 
     def get_tool_fields(self) -> dict[str, dict[str, Any]]:
@@ -307,6 +356,8 @@ class ChatTool(SimpleTool):
             self._last_recordable_response = None
 
     def _model_supports_code_generation(self) -> bool:
+        if self._active_cli_seat is not None:
+            return False
         context = getattr(self, "_model_context", None)
         if not context:
             return False
@@ -384,6 +435,163 @@ class ChatTool(SimpleTool):
         Return Chat tool-style web search guidance.
         """
         return self.get_chat_style_websearch_guidance()
+
+    def get_websearch_instruction(self, tool_specific: Optional[str] = None) -> str:
+        if self._active_cli_seat is not None:
+            return ""
+        return super().get_websearch_instruction(tool_specific)
+
+    # === CLI seat routing ===
+
+    def _resolves_as_api_model(self, model_name: str) -> bool:
+        try:
+            provider = self.get_model_provider(model_name)
+            provider.get_capabilities(model_name)
+        except Exception:
+            return False
+        return True
+
+    def resolve_cli_seat(self, model_name: Optional[str]) -> Optional[CLISeat]:
+        """Resolve a subscription CLI seat name; a declared but disabled seat fails loudly."""
+        registry, error, declared_names = get_cli_seat_state(self._resolves_as_api_model)
+        normalized = (model_name or "").strip().lower()
+        base_name, _, option = normalized.partition(":")
+        if registry is None:
+            if base_name in declared_names:
+                raise ValueError(f"CLI seat '{model_name}' is configured but disabled: {error}")
+            return None
+        if option and registry.resolve(base_name) is not None:
+            raise ValueError(f"CLI seat '{base_name}' takes no ':{option}' suffix; set thinking_mode instead.")
+        return registry.resolve(normalized)
+
+    def validate_cli_seat_request(self, request, seat: CLISeat) -> None:
+        if self.get_request_continuation_id(request):
+            raise ValueError(
+                f"CLI seat '{seat.name}' is single-shot: continuation_id is not supported. "
+                "Start a new call with the full context inlined or passed via absolute_file_paths."
+            )
+        if self.get_request_images(request):
+            raise ValueError(f"CLI seat '{seat.name}' is prompt-only: images are not supported.")
+        requested_mode = request.thinking_mode if "thinking_mode" in request.model_fields_set else None
+        effort_for_thinking_mode(requested_mode, default=CHAT_SEAT_DEFAULT_EFFORT)
+
+    async def generate_model_response(
+        self,
+        *,
+        request,
+        provider,
+        prompt: str,
+        system_prompt: str,
+        temperature: float,
+        thinking_mode: Optional[str],
+        images: Optional[list],
+    ):
+        seat = self._active_cli_seat
+        self._seat_metadata = None
+        if seat is None:
+            return await super().generate_model_response(
+                request=request,
+                provider=provider,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                thinking_mode=thinking_mode,
+                images=images,
+            )
+
+        requested_mode = request.thinking_mode if "thinking_mode" in request.model_fields_set else None
+        effort = effort_for_thinking_mode(requested_mode, default=CHAT_SEAT_DEFAULT_EFFORT)
+        chat_seat = dataclasses.replace(
+            seat,
+            effort=effort,
+            cli_timeout_s=min(seat.cli_timeout_s, CHAT_SEAT_CLI_TIMEOUT_S),
+            min_cli_budget_s=min(seat.min_cli_budget_s, CHAT_SEAT_CLI_TIMEOUT_S),
+        )
+        fallback_supports_thinking = self._model_context.capabilities.supports_extended_thinking
+        fallback_thinking_mode = (requested_mode or CHAT_SEAT_DEFAULT_EFFORT) if fallback_supports_thinking else None
+
+        async def api_fallback() -> dict[str, Any]:
+            try:
+                response = await asyncio.to_thread(
+                    provider.generate_content,
+                    prompt=prompt,
+                    model_name=seat.fallback_model,
+                    system_prompt=system_prompt,
+                    temperature=temperature,
+                    thinking_mode=fallback_thinking_mode,
+                    images=None,
+                )
+            except Exception as exc:
+                return {"status": "error", "error": describe_exception(exc)}
+            if not (response.content or "").strip():
+                return {"status": "error", "error": "API fallback returned an empty response"}
+            response_metadata = response.metadata if isinstance(response.metadata, dict) else {}
+            return {
+                "status": "success",
+                "text": response.content,
+                "model_used": response.model_name or seat.fallback_model,
+                "metadata": {"provider_model_name": response_metadata.get("provider_model_name")},
+                "usage": response.usage,
+            }
+
+        outcome = await consult_seat_with_fallback(
+            chat_seat,
+            system_prompt=system_prompt,
+            build_prompt=lambda: prompt,
+            deadline_at=time.monotonic() + CHAT_SEAT_DEADLINE_S,
+            api_fallback=api_fallback,
+            instruction=CLI_ADVISOR_INSTRUCTION,
+            instructions_header=CLI_ADVISOR_INSTRUCTIONS_HEADER,
+            header=CLI_ADVISOR_HEADER,
+            queue_wait_s=CHAT_SEAT_QUEUE_WAIT_S,
+            enforce_fallback_deadline=True,
+        )
+        if outcome.status != "success" or not outcome.text.strip():
+            raise ValueError(outcome.error or f"CLI seat '{seat.name}' and its API fallback returned no answer")
+
+        frontend = get_current_client_frontend()
+        self._seat_metadata = {
+            "cli_seat": seat.name,
+            "transport": outcome.backend,
+            "model_used": outcome.model_used,
+            "effort": outcome.effort if outcome.backend == "cli" else None,
+            "fallback_model": seat.fallback_model,
+            "fallback_reason": outcome.fallback_reason,
+            "same_vendor_as_host": frontend in seat.host_dedup_frontends,
+            "attempts": outcome.attempts,
+            "duration_seconds": outcome.duration_seconds,
+        }
+        if outcome.backend == "api_fallback":
+            self._seat_metadata["fallback_thinking_mode"] = fallback_thinking_mode
+        if outcome.cli_error:
+            self._seat_metadata["cli_error"] = outcome.cli_error
+        provider_model_name = (
+            f"{seat.client}:{outcome.model_used}"
+            if outcome.backend == "cli"
+            else ((outcome.fallback_payload or {}).get("metadata") or {}).get("provider_model_name")
+        )
+        return ModelResponse(
+            content=outcome.text,
+            usage=outcome.usage or (outcome.fallback_payload or {}).get("usage") or {},
+            model_name=outcome.model_used or seat.name,
+            friendly_name=seat.name,
+            metadata={"provider_model_name": provider_model_name} if provider_model_name else {},
+        )
+
+    def _create_continuation_offer(self, request, model_info: Optional[dict] = None):
+        if self._active_cli_seat is not None:
+            return None
+        return super()._create_continuation_offer(request, model_info)
+
+    def _parse_response(self, raw_text: str, request, model_info: Optional[dict] = None):
+        tool_output = super()._parse_response(raw_text, request, model_info)
+        if self._active_cli_seat is not None and self._seat_metadata:
+            merged = dict(tool_output.metadata or {})
+            merged.update(self._seat_metadata)
+            if self._seat_metadata["transport"] == "cli":
+                merged["provider_used"] = "cli"
+            tool_output.metadata = merged
+        return tool_output
 
 
 logger = logging.getLogger(__name__)

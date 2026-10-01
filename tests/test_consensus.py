@@ -276,8 +276,10 @@ class TestConsensusTool:
             original_proposal=None,
             relevant_files=None,
             images=None,
+            deadline_at=None,
+            seat_progress=None,
         ):
-            del request, relevant_files, images
+            del request, relevant_files, images, deadline_at
             if model_config["model"].endswith("-first"):
                 first_consult_started[original_proposal].set()
                 await asyncio.gather(*(event.wait() for event in first_consult_started.values()))
@@ -295,6 +297,7 @@ class TestConsensusTool:
                 {
                     "step": label,
                     "step_number": 1,
+                    "mode": "sequential",
                     "total_steps": 2,
                     "next_step_required": True,
                     "findings": f"{label} findings",
@@ -314,6 +317,7 @@ class TestConsensusTool:
                 {
                     "step": f"notes for {label}",
                     "step_number": 2,
+                    "mode": "sequential",
                     "total_steps": 2,
                     "next_step_required": False,
                     "findings": f"{label} synthesis notes",
@@ -603,7 +607,6 @@ class TestConsensusTool:
             patch.object(tool, "_get_stance_enhanced_prompt") as mock_get_prompt,
             patch.object(tool, "get_name", return_value="consensus"),
         ):
-
             # Setup mocks
             mock_provider = Mock()
             mock_provider.generate_content = Mock(

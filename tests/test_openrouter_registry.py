@@ -49,6 +49,235 @@ class TestOpenRouterModelRegistry:
         finally:
             os.unlink(temp_path)
 
+    def test_provider_only_is_stripped_and_deduplicated(self):
+        """Test per-model OpenRouter provider pinning metadata."""
+        config_data = {
+            "models": [
+                {
+                    "model_name": "test/pinned-model",
+                    "aliases": ["pinned"],
+                    "provider_only": [" together ", "fireworks", "together"],
+                }
+            ]
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(config_data, f)
+            temp_path = f.name
+
+        try:
+            registry = OpenRouterModelRegistry(config_path=temp_path)
+            assert registry.get_entry("test/pinned-model") == {
+                "allow_non_zdr": False,
+                "provider_only": ["together", "fireworks"],
+            }
+        finally:
+            os.unlink(temp_path)
+
+    @pytest.mark.parametrize("provider_only", [None, [], "together", [42], [""], ["  "]])
+    def test_provider_only_rejects_invalid_values(self, provider_only):
+        """Test provider_only requires a non-empty list of non-empty strings."""
+        config_data = {
+            "models": [
+                {
+                    "model_name": "test/invalid-provider-only",
+                    "provider_only": provider_only,
+                }
+            ]
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(config_data, f)
+            temp_path = f.name
+
+        try:
+            with pytest.raises(ValueError, match="provider_only"):
+                OpenRouterModelRegistry(config_path=temp_path)
+        finally:
+            os.unlink(temp_path)
+
+    def test_byok_model_requires_provider_only(self):
+        """Test BYOK model rows require an OpenRouter provider pin."""
+        config_data = {
+            "provider_preferences": {
+                "ignore": ["novita"],
+                "require_pins": ["x-ai/", "google/"],
+            },
+            "models": [{"model_name": "~google/test-unpinned"}],
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(config_data, f)
+            temp_path = f.name
+
+        try:
+            with pytest.raises(ValueError, match="google/test-unpinned: BYOK model rows must set provider_only"):
+                OpenRouterModelRegistry(config_path=temp_path)
+        finally:
+            os.unlink(temp_path)
+
+    def test_byok_model_accepts_provider_only(self):
+        """Test BYOK model rows accept a valid OpenRouter provider pin."""
+        config_data = {
+            "provider_preferences": {
+                "ignore": ["novita"],
+                "require_pins": ["x-ai/", "google/"],
+            },
+            "models": [
+                {
+                    "model_name": "google/test-pinned",
+                    "provider_only": [" google-ai-studio "],
+                }
+            ]
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(config_data, f)
+            temp_path = f.name
+
+        try:
+            registry = OpenRouterModelRegistry(config_path=temp_path)
+            assert registry.ignored_providers == ["novita"]
+            assert registry.required_pin_prefixes == ["x-ai/", "google/"]
+            assert registry.get_entry("google/test-pinned") == {
+                "allow_non_zdr": False,
+                "provider_only": ["google-ai-studio"],
+            }
+        finally:
+            os.unlink(temp_path)
+
+    def test_byok_model_without_provider_only_is_accepted_without_required_pins(self):
+        """Test provider pin enforcement is opt-in."""
+        config_data = {"models": [{"model_name": "google/test-unpinned"}]}
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(config_data, f)
+            temp_path = f.name
+
+        try:
+            registry = OpenRouterModelRegistry(config_path=temp_path)
+            assert registry.resolve("google/test-unpinned") is not None
+            assert registry.required_pin_prefixes == []
+        finally:
+            os.unlink(temp_path)
+
+    def test_required_pin_prefixes_are_stripped_and_deduplicated(self):
+        """Test required pin prefixes are normalized and exposed defensively."""
+        config_data = {
+            "provider_preferences": {
+                "require_pins": [" x-ai/ ", "google/", "x-ai/"],
+            },
+            "models": [],
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(config_data, f)
+            temp_path = f.name
+
+        try:
+            registry = OpenRouterModelRegistry(config_path=temp_path)
+            prefixes = registry.required_pin_prefixes
+            prefixes.append("mutated/")
+            assert registry.required_pin_prefixes == ["x-ai/", "google/"]
+        finally:
+            os.unlink(temp_path)
+
+    @pytest.mark.parametrize("require_pins", [None, "google/", [42], [""], ["  "]])
+    def test_required_pin_prefixes_reject_invalid_values(self, require_pins):
+        """Test required pin prefixes must be a list of non-empty strings."""
+        config_data = {
+            "provider_preferences": {"require_pins": require_pins},
+            "models": [],
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(config_data, f)
+            temp_path = f.name
+
+        try:
+            with pytest.raises(ValueError, match="require_pins"):
+                OpenRouterModelRegistry(config_path=temp_path)
+        finally:
+            os.unlink(temp_path)
+
+    def test_unknown_provider_preferences_key_is_rejected(self):
+        """Test provider preferences remain fail-closed for unknown keys."""
+        config_data = {
+            "provider_preferences": {"ignore": [], "require_pins": [], "order": []},
+            "models": [],
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(config_data, f)
+            temp_path = f.name
+
+        try:
+            with pytest.raises(ValueError, match="Unsupported provider_preferences keys: \\['order'\\]"):
+                OpenRouterModelRegistry(config_path=temp_path)
+        finally:
+            os.unlink(temp_path)
+
+    def test_failed_required_pin_reload_preserves_previous_extras(self):
+        """Test a rejected reload does not partially replace routing metadata."""
+        initial_config = {
+            "provider_preferences": {"require_pins": ["google/"]},
+            "models": [
+                {
+                    "model_name": "google/test-model",
+                    "provider_only": ["old-provider"],
+                }
+            ],
+        }
+        invalid_config = {
+            "provider_preferences": {"require_pins": ["google/"]},
+            "models": [
+                {
+                    "model_name": "google/test-model",
+                    "provider_only": ["new-provider"],
+                },
+                {"model_name": "google/test-unpinned"},
+            ],
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(initial_config, f)
+            temp_path = f.name
+
+        try:
+            registry = OpenRouterModelRegistry(config_path=temp_path)
+            with open(temp_path, "w") as f:
+                json.dump(invalid_config, f)
+            with pytest.raises(ValueError, match="google/test-unpinned"):
+                registry.reload()
+            assert registry.get_entry("google/test-model") == {
+                "allow_non_zdr": False,
+                "provider_only": ["old-provider"],
+            }
+        finally:
+            os.unlink(temp_path)
+
+    def test_unknown_model_fields_still_rejected_with_provider_only(self):
+        """Test provider_only does not weaken unknown-field validation."""
+        config_data = {
+            "models": [
+                {
+                    "model_name": "test/unknown-field",
+                    "provider_only": ["together"],
+                    "unsupported_key": True,
+                }
+            ]
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(config_data, f)
+            temp_path = f.name
+
+        try:
+            with pytest.raises(ValueError, match="unsupported_key"):
+                OpenRouterModelRegistry(config_path=temp_path)
+        finally:
+            os.unlink(temp_path)
+
     def test_environment_variable_override(self):
         """Test OPENROUTER_MODELS_CONFIG_PATH environment variable."""
         # Create custom config

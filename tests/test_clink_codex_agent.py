@@ -113,6 +113,10 @@ async def test_timeout_terminates_owned_process_group_then_reaps(monkeypatch, co
         return process
 
     def fake_killpg(process_group_id, sent_signal):
+        if sent_signal == 0:
+            if process.release.is_set():
+                raise ProcessLookupError
+            return
         signals.append((process_group_id, sent_signal))
         process.last_signal = sent_signal
         if sent_signal == signal.SIGTERM:
@@ -158,6 +162,10 @@ async def test_timeout_escalates_stuck_process_group_to_kill(monkeypatch, codex_
         return process
 
     def fake_killpg(process_group_id, sent_signal):
+        if sent_signal == 0:
+            if process.release.is_set():
+                raise ProcessLookupError
+            return
         signals.append((process_group_id, sent_signal))
         process.last_signal = sent_signal
         if sent_signal == signal.SIGKILL:

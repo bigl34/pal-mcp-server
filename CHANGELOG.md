@@ -2,6 +2,113 @@
 
 <!-- version list -->
 
+## v9.14.1 (2026-09-25)
+
+### Chores
+
+- Restore Entire checkpoint coverage
+  ([`f92de10`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/f92de10b57eb40baa692a220d7e0bcff04d3e3fc))
+
+- Sync version to config.py [skip ci]
+  ([`fea2f88`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/fea2f881d84057df05cec32d285ff7b18369e1e4))
+
+
+## v9.14.0 (2026-09-25)
+
+### Bug Fixes
+
+- **chat**: Per-call seat state, bounded fallback, single-shot guards
+  ([`6579cdf`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/6579cdf7d04b3e1d0322e603a775c8352c7e131a))
+
+- **consensus**: Harden CLI seats after review
+  ([`be6775b`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/be6775bdce306644cd52c362a573911b05be177d))
+
+### Chores
+
+- Restore Entire checkpoint coverage
+  ([`a6d134e`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/a6d134e0cec372328f255a9b3d1222e6b299fefc))
+
+- Restore Entire checkpoint coverage
+  ([`2dd830c`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/2dd830c93d0db5daacafb2792463bcdb17e7c37b))
+
+- Restore Entire checkpoint coverage
+  ([`74bb204`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/74bb20432a4bd686fe1d432adb935a51927a8d92))
+
+- Sync version to config.py [skip ci]
+  ([`0df3e14`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/0df3e14808d372af5460a240dff8a12499d3b4bf))
+
+- Sync version to config.py [skip ci]
+  ([`ec6bbdf`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/ec6bbdf6a960c5876d0c5609b8a051dacce673f3))
+
+- Sync version to config.py [skip ci]
+  ([`b502e98`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/b502e984426a787f33a0715ee4e1dc537310e34f))
+
+### Features
+
+- **chat**: Route CLI seat names through chat with API fallback
+  ([`0323ad6`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/0323ad6437c4147ebb74f01d12fc290d9068755a))
+
+- **consensus**: Add CLI-backed consensus seats with API fallback
+  ([`368397f`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/368397f28645b2c5c3e8a1a9cf9df4f4583a25aa))
+
+
+## v9.13.1 (2026-09-15)
+
+### Bug Fixes
+
+- **openrouter**: Surface HTTP-200 error envelopes and retry 429s; key Zen safety lookups by wire id
+  ([`54e58fd`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/54e58fd5d8838fbe0cca770f8f18c924df4a1def))
+
+### Chores
+
+- Restore Entire checkpoint coverage
+  ([`e26e5b6`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/e26e5b6c193affa2d5e616702f30312deddd5de6))
+
+- Restore Entire checkpoint coverage
+  ([`25522a0`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/25522a0e8d2788d01f479441ca05ad430e108217))
+
+- Sync version to config.py [skip ci]
+  ([`617da32`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/617da32b36f95090f4ac1aebb15472a5d9dd331b))
+
+- Sync version to config.py [skip ci]
+  ([`15059d6`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/15059d6fbf4d1aeaa3fc6ce38ccb09b3bc521063))
+
+
+## v9.13.0 (2026-09-14)
+
+### Chores
+
+- Sync version to config.py [skip ci]
+  ([`ca5f330`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/ca5f33012c8ff243a6c3467668011fb0fd864d2f))
+
+### Features
+
+- **openrouter**: Enforce provider_only via opt-in require_pins prefixes
+  ([`b1a3841`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/b1a38416ee0e38596f45ab451b17f8afe9ae5c00))
+
+
+## v9.12.0 (2026-09-14)
+
+### Chores
+
+- Restore Entire checkpoint coverage
+  ([`0c91b65`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/0c91b659b280b53451fa2057e18d211df5bba40e))
+
+- Restore Entire checkpoint coverage
+  ([`820bdaf`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/820bdafa4d6f84131a4689f0fd6de0202ff93d9a))
+
+- Sync version to config.py [skip ci]
+  ([`b24b9b8`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/b24b9b85393f3af01e1f00ba18771950e76bba42))
+
+- Sync version to config.py [skip ci]
+  ([`d06a45e`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/d06a45ece4a218294f9c81c2440d4d700c728ed5))
+
+### Features
+
+- **openrouter**: Add per-model provider_only routing pin
+  ([`8cfc4ed`](https://github.com/YOUR_GITHUB_USER/pal-mcp-server-private/commit/8cfc4ed53c2a10311b7b37b1ae69e08a300cc9ee))
+
+
 ## v9.11.0 (2026-09-11)
 
 ### Chores

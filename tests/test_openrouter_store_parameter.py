@@ -13,6 +13,7 @@ import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import utils.model_restrictions
@@ -21,6 +22,31 @@ from providers.openrouter import OpenRouterProvider
 from providers.registries.base import CapabilityModelRegistry
 from providers.registries.openrouter import OpenRouterModelRegistry
 from providers.shared import ModelCapabilities, ProviderType
+
+
+def _chat_response(model, content="Test response"):
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content=content),
+                finish_reason="stop",
+            )
+        ],
+        usage=None,
+        model=model,
+        id="chatcmpl-test",
+        created=123,
+    )
+
+
+def _responses_response(content="Test response", model=None):
+    return SimpleNamespace(
+        output_text=content,
+        usage=None,
+        model=model,
+        id="resp-test",
+        created_at=123,
+    )
 
 
 class MockOpenRouterProvider(OpenAICompatibleProvider):
@@ -318,11 +344,7 @@ class TestStoreParameterHandling(unittest.TestCase):
 
         def capture_create(**kwargs):
             captured_params.update(kwargs)
-            # Return a mock response
-            mock_response = Mock()
-            mock_response.output_text = "Test response"
-            mock_response.usage = None
-            return mock_response
+            return _responses_response(model=kwargs["model"])
 
         mock_client_instance = Mock()
         mock_client_instance.responses.create = capture_create
@@ -562,18 +584,7 @@ class TestStoreParameterHandling(unittest.TestCase):
 
         def capture_create(**kwargs):
             captured_params.update(kwargs)
-            mock_message = Mock()
-            mock_message.content = "Test response"
-            mock_choice = Mock()
-            mock_choice.message = mock_message
-            mock_choice.finish_reason = "stop"
-            mock_response = Mock()
-            mock_response.choices = [mock_choice]
-            mock_response.usage = None
-            mock_response.model = kwargs["model"]
-            mock_response.id = "chatcmpl-test"
-            mock_response.created = 123
-            return mock_response
+            return _chat_response(kwargs["model"])
 
         mock_client_instance = Mock()
         mock_client_instance.chat.completions.create = capture_create
@@ -669,10 +680,22 @@ class TestOpenRouterNonZdrException(unittest.TestCase):
         self.assertEqual(registry.resolve("fusion").model_name, "openrouter/fusion")
         self.assertEqual(registry.resolve("fable-latest").model_name, "~anthropic/claude-fable-latest")
         self.assertEqual(registry.resolve("fable").model_name, "~anthropic/claude-fable-latest")
-        self.assertEqual(registry.get_entry("anthropic/claude-fable-5"), {"allow_non_zdr": True})
-        self.assertEqual(registry.get_entry("~anthropic/claude-fable-latest"), {"allow_non_zdr": True})
-        self.assertEqual(registry.get_entry("openrouter/fusion"), {"allow_non_zdr": True})
-        self.assertEqual(registry.get_entry("deepseek/deepseek-v4-pro"), {"allow_non_zdr": False})
+        self.assertEqual(
+            registry.get_entry("anthropic/claude-fable-5"),
+            {"allow_non_zdr": True, "provider_only": None},
+        )
+        self.assertEqual(
+            registry.get_entry("~anthropic/claude-fable-latest"),
+            {"allow_non_zdr": True, "provider_only": None},
+        )
+        self.assertEqual(
+            registry.get_entry("openrouter/fusion"),
+            {"allow_non_zdr": True, "provider_only": None},
+        )
+        self.assertEqual(
+            registry.get_entry("deepseek/deepseek-v4-pro"),
+            {"allow_non_zdr": False, "provider_only": None},
+        )
 
     def test_allow_non_zdr_rejected_by_generic_registry(self):
         """allow_non_zdr is OpenRouter-specific and not a global capability."""
@@ -712,18 +735,7 @@ class TestOpenRouterNonZdrException(unittest.TestCase):
 
         def capture_create(**kwargs):
             captured_params.update(kwargs)
-            mock_message = Mock()
-            mock_message.content = "Test response"
-            mock_choice = Mock()
-            mock_choice.message = mock_message
-            mock_choice.finish_reason = "stop"
-            mock_response = Mock()
-            mock_response.choices = [mock_choice]
-            mock_response.usage = None
-            mock_response.model = kwargs["model"]
-            mock_response.id = "chatcmpl-test"
-            mock_response.created = 123
-            return mock_response
+            return _chat_response(kwargs["model"])
 
         mock_client_instance = Mock()
         mock_client_instance.chat.completions.create = capture_create
@@ -753,18 +765,7 @@ class TestOpenRouterNonZdrException(unittest.TestCase):
 
         def capture_create(**kwargs):
             captured_params.update(kwargs)
-            mock_message = Mock()
-            mock_message.content = "Test response"
-            mock_choice = Mock()
-            mock_choice.message = mock_message
-            mock_choice.finish_reason = "stop"
-            mock_response = Mock()
-            mock_response.choices = [mock_choice]
-            mock_response.usage = None
-            mock_response.model = kwargs["model"]
-            mock_response.id = "chatcmpl-test"
-            mock_response.created = 123
-            return mock_response
+            return _chat_response(kwargs["model"])
 
         mock_client_instance = Mock()
         mock_client_instance.chat.completions.create = capture_create
@@ -794,18 +795,7 @@ class TestOpenRouterNonZdrException(unittest.TestCase):
 
         def capture_create(**kwargs):
             captured_params.update(kwargs)
-            mock_message = Mock()
-            mock_message.content = "Test response"
-            mock_choice = Mock()
-            mock_choice.message = mock_message
-            mock_choice.finish_reason = "stop"
-            mock_response = Mock()
-            mock_response.choices = [mock_choice]
-            mock_response.usage = None
-            mock_response.model = kwargs["model"]
-            mock_response.id = "chatcmpl-test"
-            mock_response.created = 123
-            return mock_response
+            return _chat_response(kwargs["model"])
 
         mock_client_instance = Mock()
         mock_client_instance.chat.completions.create = capture_create
@@ -837,18 +827,7 @@ class TestOpenRouterNonZdrException(unittest.TestCase):
 
         def capture_create(**kwargs):
             captured_params.update(kwargs)
-            mock_message = Mock()
-            mock_message.content = "Test response"
-            mock_choice = Mock()
-            mock_choice.message = mock_message
-            mock_choice.finish_reason = "stop"
-            mock_response = Mock()
-            mock_response.choices = [mock_choice]
-            mock_response.usage = None
-            mock_response.model = kwargs["model"]
-            mock_response.id = "chatcmpl-test"
-            mock_response.created = 123
-            return mock_response
+            return _chat_response(kwargs["model"])
 
         mock_client_instance = Mock()
         mock_client_instance.chat.completions.create = capture_create
@@ -877,10 +856,7 @@ class TestOpenRouterNonZdrException(unittest.TestCase):
 
         def capture_create(**kwargs):
             captured_params.update(kwargs)
-            mock_response = Mock()
-            mock_response.output_text = "Test response"
-            mock_response.usage = None
-            return mock_response
+            return _responses_response(model=kwargs["model"])
 
         mock_client_instance = Mock()
         mock_client_instance.responses.create = capture_create
@@ -945,18 +921,7 @@ def _write_openrouter_config(directory, provider_preferences=None):
 def _chat_capture(captured_params):
     def capture_create(**kwargs):
         captured_params.update(kwargs)
-        mock_message = Mock()
-        mock_message.content = "Test response"
-        mock_choice = Mock()
-        mock_choice.message = mock_message
-        mock_choice.finish_reason = "stop"
-        mock_response = Mock()
-        mock_response.choices = [mock_choice]
-        mock_response.usage = None
-        mock_response.model = kwargs["model"]
-        mock_response.id = "chatcmpl-test"
-        mock_response.created = 123
-        return mock_response
+        return _chat_response(kwargs["model"])
 
     mock_client_instance = Mock()
     mock_client_instance.chat.completions.create = capture_create
@@ -1142,10 +1107,7 @@ class TestOpenRouterIgnoredProviders(unittest.TestCase):
 
         def capture_create(**kwargs):
             captured_params.update(kwargs)
-            mock_response = Mock()
-            mock_response.output_text = "Test response"
-            mock_response.usage = None
-            return mock_response
+            return _responses_response(model=kwargs["model"])
 
         mock_client_instance = Mock()
         mock_client_instance.responses.create = capture_create

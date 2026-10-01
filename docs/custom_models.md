@@ -310,12 +310,14 @@ rules rather than dropping unrelated models.
 - `supports_function_calling`: Whether the model supports function/tool calling
 - `default_reasoning_mode`: Optional provider operating mode (`standard` or `pro`)
 - `default_reasoning_effort`: Optional provider-specific effort value passed through unchanged
+- `default_thinking_mode`: Optional PAL thinking mode (`minimal`, `low`, `medium`, `high`, `max`) used when a request omits `thinking_mode`; replaces the tool default, never an explicit request value. On OpenRouter chat requests to rows with `supports_extended_thinking: true`, the resolved mode is sent as `reasoning.effort` (`max` maps to `xhigh`); the consensus tool ignores it and always uses `medium`
 - `host_dedup_frontends`: Frontends that skip this profile for same-host consensus diversity
+- `provider_only`: OpenRouter-only provider slugs that may serve the model; disables provider fallbacks
 - `description`: Human-readable description of the model
 
 **Important:** Keep OpenRouter and Custom models in their respective files so that requests are routed correctly.
 
-#### OpenRouter Provider Blocklist
+#### OpenRouter Provider Preferences
 
 `openrouter_models.json` may carry a top-level `provider_preferences` block
 beside `models`. Its `ignore` list holds OpenRouter provider slugs (as returned
@@ -325,13 +327,21 @@ by `GET /api/v1/providers`) that every request excludes via the body-level
 
 ```json
 {
-  "provider_preferences": { "ignore": ["novita", "alibaba"] },
+  "provider_preferences": {
+    "ignore": ["novita", "alibaba"],
+    "require_pins": ["x-ai/", "google/"]
+  },
   "models": [ ... ]
 }
 ```
 
-Only `ignore` is supported; other keys raise at startup. OpenRouter merges this
-list with the account-wide ignored providers, so it can only add exclusions.
+OpenRouter merges `ignore` with the account-wide ignored providers, so it can
+only add exclusions. The optional `require_pins` list contains model-name
+prefixes whose matching entries must set `provider_only`; a leading `~` is
+ignored during matching. Without `require_pins`, no model prefix is enforced.
+Only `ignore` and `require_pins` are supported; other keys raise at startup.
+Individual model entries may set `provider_only` to a non-empty list of provider
+slugs; PAL sends it as `provider.only` and disables fallbacks.
 
 ## Available Models
 

@@ -1,0 +1,33 @@
+{
+  "_README": "CLI-backed consensus seats. Each seat runs its model through a subscription CLI in an isolated, prompt-only review invocation and falls back to fallback_model through the API when the CLI fails. Override with CLI_SEATS_CONFIG_PATH.",
+  "seats": [
+    {
+      "name": "astra-cli",
+      "client": "codex",
+      "model": "gpt-6-astra",
+      "effort": "max",
+      "fallback_model": "gpt-6-astra-pro",
+      "cli_enabled": true,
+      "host_dedup_frontends": [
+        "codex"
+      ],
+      "cli_timeout_s": 1080,
+      "fallback_reserve_s": 400,
+      "min_cli_budget_s": 60
+    },
+    {
+      "name": "fable-cli",
+      "client": "claude",
+      "model": "fable",
+      "effort": "max",
+      "fallback_model": "fable-latest",
+      "cli_enabled": true,
+      "host_dedup_frontends": [
+        "claude"
+      ],
+      "cli_timeout_s": 1080,
+      "fallback_reserve_s": 400,
+      "min_cli_budget_s": 60
+    }
+  ]
+}

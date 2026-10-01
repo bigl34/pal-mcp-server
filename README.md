@@ -211,7 +211,7 @@ PAL activates any provider that has credentials in your `.env`. See `.env.exampl
 - **[`chat`](docs/tools/chat.md)** - Brainstorm ideas, get second opinions, validate approaches. With capable models (GPT-5.2 Pro, Gemini 3.0 Pro), generates complete code / implementation
 - **[`thinkdeep`](docs/tools/thinkdeep.md)** - Extended reasoning, edge case analysis, alternative perspectives
 - **[`planner`](docs/tools/planner.md)** - Break down complex projects into structured, actionable plans
-- **[`consensus`](docs/tools/consensus.md)** - Get expert opinions from multiple AI models with stance steering
+- **[`consensus`](docs/tools/consensus.md)** - Get expert opinions from multiple AI models with stance steering, consulted concurrently in one call
 
 **Code Analysis & Quality**
 - **[`debug`](docs/tools/debug.md)** - Systematic investigation and root cause analysis

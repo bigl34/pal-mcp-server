@@ -19,6 +19,22 @@ from .shared import (
     ProviderType,
 )
 
+logger = logging.getLogger(__name__)
+
+OPENROUTER_REASONING_EFFORT = {
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "max": "xhigh",
+}
+
+
+def _openrouter_reasoning_options(thinking_mode: str) -> dict:
+    if thinking_mode not in OPENROUTER_REASONING_EFFORT:
+        raise ValueError(f"Unsupported OpenRouter thinking mode: {thinking_mode}")
+    return {"reasoning": {"effort": OPENROUTER_REASONING_EFFORT[thinking_mode]}}
+
 
 class OpenAICompatibleProvider(ModelProvider):
     """Shared implementation for OpenAI API lookalikes.
@@ -387,6 +403,78 @@ class OpenAICompatibleProvider(ModelProvider):
 
         return content
 
+    def _raise_for_error_envelope(self, response, *, endpoint: str) -> None:
+        if self.get_provider_type() != ProviderType.OPENROUTER:
+            return
+
+        error = self._extract_error_envelope(response)
+        if not error:
+            return
+
+        code = self._error_envelope_value(error, "code")
+        metadata = self._error_envelope_value(error, "metadata") or {}
+        error_type = (
+            self._error_envelope_value(error, "type")
+            or self._error_envelope_value(error, "error_type")
+            or self._error_envelope_value(metadata, "error_type")
+            or self._error_envelope_value(metadata, "type")
+        )
+        message = self._error_envelope_value(error, "message") or str(error)
+
+        structured_error = {
+            "error": {
+                "code": code,
+                "type": error_type,
+                "message": message,
+            }
+        }
+        formatted = (
+            f"{self.FRIENDLY_NAME} {endpoint} error envelope (HTTP 200): "
+            f"code={code} type={error_type}: {message}"
+        )
+        if isinstance(code, int):
+            formatted = f"{formatted} | Error code: {code} - {structured_error}"
+        else:
+            formatted = f"{formatted} | {structured_error}"
+
+        raise RuntimeError(formatted)
+
+    @staticmethod
+    def _extract_error_envelope(response):
+        response_attrs = getattr(response, "__dict__", {}) or {}
+        error = response_attrs.get("error")
+        if error is None:
+            error = getattr(response, "error", None)
+
+        if OpenAICompatibleProvider._is_populated_error_envelope(error):
+            return error
+
+        model_extra = getattr(response, "model_extra", {}) or {}
+        if isinstance(model_extra, dict):
+            error = model_extra.get("error")
+            if OpenAICompatibleProvider._is_populated_error_envelope(error):
+                return error
+
+        return None
+
+    @staticmethod
+    def _is_populated_error_envelope(error) -> bool:
+        if error is None:
+            return False
+        if isinstance(error, dict):
+            return bool(error)
+
+        return any(
+            getattr(error, key, None) is not None for key in ("code", "message", "metadata", "type", "error_type")
+        )
+
+    @staticmethod
+    def _error_envelope_value(error, key: str):
+        if isinstance(error, dict):
+            return error.get(key)
+
+        return getattr(error, key, None)
+
     def _provider_request_options(self, model_name: Optional[str] = None) -> dict:
         """Return provider-specific request options for OpenAI-compatible payloads."""
 
@@ -397,6 +485,10 @@ class OpenAICompatibleProvider(ModelProvider):
             ignored_providers = self._openrouter_ignored_providers()
             if ignored_providers:
                 provider_preferences["ignore"] = list(ignored_providers)
+            only = self._openrouter_provider_only(model_name)
+            if only:
+                provider_preferences["only"] = list(only)
+                provider_preferences["allow_fallbacks"] = False
             return {"extra_body": {"provider": provider_preferences}}
         return {}
 
@@ -409,6 +501,11 @@ class OpenAICompatibleProvider(ModelProvider):
         """Return provider slugs to exclude from OpenRouter routing."""
 
         return []
+
+    def _openrouter_provider_only(self, model_name: Optional[str]) -> list[str] | None:
+        """Return provider slugs allowed to route a configured OpenRouter model."""
+
+        return None
 
     @staticmethod
     def _to_responses_content(content, role: str) -> list:
@@ -620,6 +717,7 @@ class OpenAICompatibleProvider(ModelProvider):
             # background=True returns a queued/in_progress run; poll it to a
             # terminal state before extracting output.
             response = self._await_responses_completion(response)
+            self._raise_for_error_envelope(response, endpoint="responses")
 
             content = self._safe_extract_output_text(response)
 
@@ -802,6 +900,21 @@ class OpenAICompatibleProvider(ModelProvider):
                 **kwargs,
             )
 
+        if (
+            kwargs.get("thinking_mode") is not None
+            and routing_capabilities is not None
+            and routing_capabilities.supports_extended_thinking
+            and self.get_provider_type() == ProviderType.OPENROUTER
+        ):
+            thinking_mode = kwargs["thinking_mode"]
+            reasoning_options = _openrouter_reasoning_options(thinking_mode)
+            completion_params.setdefault("extra_body", {})["reasoning"] = reasoning_options["reasoning"]
+            logger.debug(
+                "OpenRouter reasoning requested mode=%s effort=%s",
+                thinking_mode,
+                reasoning_options["reasoning"]["effort"],
+            )
+
         # Retry logic with progressive delays
         max_retries = 4  # Total of 4 attempts
         retry_delays = [1, 3, 5, 8]  # Progressive delays: 1s, 3s, 5s, 8s
@@ -810,6 +923,7 @@ class OpenAICompatibleProvider(ModelProvider):
         def _attempt() -> ModelResponse:
             attempt_counter["value"] += 1
             response = self.client.chat.completions.create(**completion_params)
+            self._raise_for_error_envelope(response, endpoint="chat/completions")
 
             content = response.choices[0].message.content
             usage = self._extract_usage(response)
@@ -888,6 +1002,10 @@ class OpenAICompatibleProvider(ModelProvider):
             usage["input_tokens"] = getattr(response.usage, "prompt_tokens", 0) or 0
             usage["output_tokens"] = getattr(response.usage, "completion_tokens", 0) or 0
             usage["total_tokens"] = getattr(response.usage, "total_tokens", 0) or 0
+            completion_details = getattr(response.usage, "completion_tokens_details", None)
+            reasoning_tokens = getattr(completion_details, "reasoning_tokens", None)
+            if reasoning_tokens is not None:
+                usage["reasoning_tokens"] = reasoning_tokens
 
         return usage
 

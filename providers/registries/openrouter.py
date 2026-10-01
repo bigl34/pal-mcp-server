@@ -5,16 +5,17 @@ from __future__ import annotations
 from ..shared import ModelCapabilities, ProviderType
 from .base import CAPABILITY_FIELD_NAMES, CapabilityModelRegistry
 
-PROVIDER_PREFERENCE_KEYS = {"ignore"}
+PROVIDER_PREFERENCE_KEYS = {"ignore", "require_pins"}
 
 
 class OpenRouterModelRegistry(CapabilityModelRegistry):
     """Capability registry backed by ``conf/openrouter_models.json``."""
 
     _ignored_providers: list[str] = []
+    _required_pin_prefixes: list[str] = []
 
     def _extra_keys(self) -> set[str]:
-        return {"allow_non_zdr"}
+        return {"allow_non_zdr", "provider_only"}
 
     def __init__(self, config_path: str | None = None) -> None:
         super().__init__(
@@ -31,9 +32,13 @@ class OpenRouterModelRegistry(CapabilityModelRegistry):
 
         return list(self._ignored_providers)
 
-    def _parse_settings(self, data: dict) -> list[str]:
+    @property
+    def required_pin_prefixes(self) -> list[str]:
+        return list(self._required_pin_prefixes)
+
+    def _parse_settings(self, data: dict) -> dict[str, list[str]]:
         if "provider_preferences" not in data:
-            return []
+            return {"ignore": [], "require_pins": []}
         preferences = data["provider_preferences"]
         if not isinstance(preferences, dict):
             raise ValueError("provider_preferences must be an object")
@@ -42,28 +47,59 @@ class OpenRouterModelRegistry(CapabilityModelRegistry):
         if unknown_keys:
             raise ValueError(f"Unsupported provider_preferences keys: {sorted(unknown_keys)}")
 
-        return self._parse_ignore_list(preferences.get("ignore", []))
+        return {
+            "ignore": self._parse_preference_list(preferences.get("ignore", []), "ignore", "provider slugs"),
+            "require_pins": self._parse_preference_list(
+                preferences.get("require_pins", []), "require_pins", "model prefixes"
+            ),
+        }
 
     def _apply_settings(self, settings: object | None) -> None:
-        self._ignored_providers = list(settings or [])
+        preferences = settings if isinstance(settings, dict) else {}
+        self._ignored_providers = list(preferences.get("ignore", []))
+        self._required_pin_prefixes = list(preferences.get("require_pins", []))
 
     @staticmethod
-    def _parse_ignore_list(raw_ignore: object) -> list[str]:
-        if not isinstance(raw_ignore, list):
-            raise ValueError("provider_preferences.ignore must be a list of provider slugs")
+    def _parse_preference_list(raw: object, key: str, entries: str) -> list[str]:
+        if not isinstance(raw, list):
+            raise ValueError(f"provider_preferences.{key} must be a list of {entries}")
 
-        ignored: list[str] = []
-        for raw_slug in raw_ignore:
-            if not isinstance(raw_slug, str):
-                raise ValueError("provider_preferences.ignore entries must be strings")
-            slug = raw_slug.strip()
-            if not slug:
-                raise ValueError("provider_preferences.ignore entries must be non-empty")
-            if slug not in ignored:
-                ignored.append(slug)
-        return ignored
+        values: list[str] = []
+        for raw_value in raw:
+            if not isinstance(raw_value, str):
+                raise ValueError(f"provider_preferences.{key} entries must be strings")
+            value = raw_value.strip()
+            if not value:
+                raise ValueError(f"provider_preferences.{key} entries must be non-empty")
+            if value not in values:
+                values.append(value)
+        return values
+
+    def _settings_snapshot(self) -> dict[str, list[str]]:
+        return {
+            "ignore": list(self._ignored_providers),
+            "require_pins": list(self._required_pin_prefixes),
+        }
 
     def _finalise_entry(self, entry: dict) -> tuple[ModelCapabilities, dict]:
+        provider_only: list[str] | None = None
+        if "provider_only" in entry:
+            raw_provider_only = entry["provider_only"]
+            if not isinstance(raw_provider_only, list) or not raw_provider_only:
+                raise ValueError("provider_only must be a non-empty list of provider slugs")
+
+            provider_only = []
+            for raw_slug in raw_provider_only:
+                if not isinstance(raw_slug, str) or not raw_slug.strip():
+                    raise ValueError("provider_only entries must be non-empty strings")
+                slug = raw_slug.strip()
+                if slug not in provider_only:
+                    provider_only.append(slug)
+
+        model_name = entry["model_name"].removeprefix("~")
+        if any(model_name.startswith(prefix) for prefix in self._required_pin_prefixes) and not provider_only:
+            raise ValueError(f"{model_name}: BYOK model rows must set provider_only")
+
         provider_override = entry.get("provider")
         if isinstance(provider_override, str):
             entry_provider = ProviderType(provider_override.lower())
@@ -80,4 +116,7 @@ class OpenRouterModelRegistry(CapabilityModelRegistry):
         filtered = {k: v for k, v in entry.items() if k in CAPABILITY_FIELD_NAMES}
         filtered.setdefault("provider", entry_provider)
         capability = ModelCapabilities(**filtered)
-        return capability, {"allow_non_zdr": bool(entry.get("allow_non_zdr", False))}
+        return capability, {
+            "allow_non_zdr": bool(entry.get("allow_non_zdr", False)),
+            "provider_only": provider_only,
+        }

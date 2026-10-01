@@ -80,6 +80,7 @@ class TestConsensusConversation(ConversationBaseTest):
                 {
                     "step": "Based on our previous discussion about authentication, I need expert consensus: Should we implement OAuth2 or stick with simple session-based auth?",
                     "step_number": 1,
+                    "mode": "sequential",
                     "total_steps": 2,
                     "next_step_required": True,
                     "findings": "Initial analysis needed on OAuth2 vs session-based authentication approaches for our web application",

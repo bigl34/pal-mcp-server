@@ -349,6 +349,27 @@ class ListModelsTool(BaseTool):
         output_lines.append("")
 
         # Add summary
+        try:
+            from tools.consensus_cli_seats import CLISeatConfigError, load_cli_seats
+
+            seat_registry = load_cli_seats()
+            output_lines.append("## CLI Seats")
+            output_lines.append(
+                "**Usage**: consensus panels, and `chat` single-shot calls (effort from thinking_mode, default high); "
+                "each seat runs a subscription CLI with an API fallback"
+            )
+            for seat in seat_registry.seats:
+                state = "enabled" if seat.cli_enabled else f"CLI disabled ({seat.disabled_reason or 'unproven'})"
+                output_lines.append(
+                    f"- `{seat.name}` → {seat.client} CLI `{seat.model}` @ {seat.effort} in consensus, "
+                    f"fallback `{seat.fallback_model}` ({state})"
+                )
+            output_lines.append("")
+        except CLISeatConfigError as exc:
+            output_lines.append("## CLI Seats ❌")
+            output_lines.append(f"**Status**: configuration invalid ({exc})")
+            output_lines.append("")
+
         output_lines.append("## Summary")
 
         # Count configured providers

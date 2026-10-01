@@ -110,7 +110,7 @@ QUALITY STANDARDS
 - Reference concrete examples and precedents when possible
 
 REMINDERS
-- Your assessment will be synthesized with other expert opinions by the agent
+- Your assessment will be synthesized with other expert opinions gathered concurrently by the agent; you do not see them
 - Aim to provide unique insights that complement other perspectives
 - If files are provided, reference specific technical details in your analysis
 - Maintain professional objectivity while being decisive in your recommendations

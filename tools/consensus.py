@@ -1,16 +1,18 @@
 """
-Consensus tool - Step-by-step multi-model consensus with expert analysis
+Consensus tool - Multi-model consensus with blinded panel consultation
 
-This tool provides a structured workflow for gathering consensus from multiple models.
-It guides the CLI agent through systematic steps where the CLI agent first provides its own analysis,
-then consults each requested model one by one, and finally synthesizes all perspectives.
+This tool gathers independent verdicts from a roster of models. In the default
+parallel mode every model is consulted concurrently in a single call; the
+legacy sequential mode consults one model per step so the CLI agent can note
+each response before the next consultation.
 
 Key features:
-- Step-by-step consensus workflow with progress tracking
-- The CLI agent's initial neutral analysis followed by model-specific consultations
+- Parallel panel consultation (default) with a panel deadline
+- Sequential step-by-step mode retained for callers that drive the loop
+- Blinded consultations: every model sees only the original proposal + files
 - Context-aware file embedding
 - Support for stance-based analysis (for/against/neutral)
-- Final synthesis combining all perspectives
+- Final synthesis performed by the calling agent
 """
 
 from __future__ import annotations
@@ -18,8 +20,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import os
+import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import Field, model_validator
 
@@ -28,10 +33,21 @@ if TYPE_CHECKING:
 
 from mcp.types import TextContent
 
+from clink.agents.base import PROCESS_KILL_REAP_SECONDS, PROCESS_TERMINATION_GRACE_SECONDS
 from config import TEMPERATURE_ANALYTICAL
 from systemprompts import CONSENSUS_PROMPT
+from tools.consensus_cli_seats import (
+    CLISeat,
+    CLISeatConfigError,
+    CLISeatRegistry,
+    consult_seat_with_fallback,
+    describe_exception,
+    get_cli_seat_state,
+    run_cli_seat,
+)
 from tools.shared.base_models import WorkflowRequest
 from tools.shared.base_tool import BaseTool
+from tools.shared.exceptions import ToolExecutionError
 from utils.client_info import get_current_client_frontend
 from utils.conversation_memory import MAX_CONVERSATION_TURNS, add_turn, create_thread, get_thread
 
@@ -40,6 +56,27 @@ from .workflow.base import WorkflowTool
 logger = logging.getLogger(__name__)
 
 CONSENSUS_CHAIN_STATE_KEY = "consensus_chain_state"
+
+CONSENSUS_MODE_PARALLEL = "parallel"
+CONSENSUS_MODE_SEQUENTIAL = "sequential"
+CONSENSUS_MODES = (CONSENSUS_MODE_PARALLEL, CONSENSUS_MODE_SEQUENTIAL)
+
+CLI_CLEANUP_DRAIN_MARGIN_S = 2.0
+CONSENSUS_PANEL_DEADLINE_ENV = "CONSENSUS_PANEL_DEADLINE_S"
+DEFAULT_CONSENSUS_PANEL_DEADLINE_S = 1500.0
+PANEL_DRAIN_TIMEOUT_S = max(
+    5.0, PROCESS_TERMINATION_GRACE_SECONDS + 2 * PROCESS_KILL_REAP_SECONDS + CLI_CLEANUP_DRAIN_MARGIN_S
+)
+
+SYNTHESIS_NEXT_STEPS = (
+    "CONSENSUS GATHERING IS COMPLETE. You MUST now synthesize all perspectives and present:\n"
+    "1. Key points of AGREEMENT across models\n"
+    "2. Key points of DISAGREEMENT and why they differ\n"
+    "3. Your final consolidated recommendation\n"
+    "4. Specific, actionable next steps for implementation\n"
+    "5. Critical risks or concerns that must be addressed\n"
+    "6. Finish with exactly one line: VERDICT: <approve|revise|reject>"
+)
 
 
 @dataclass
@@ -54,11 +91,12 @@ class ConsensusChainState:
     work_history: list[dict[str, Any]] = field(default_factory=list)
     host_frontend: str = "unknown"
     host_skipped_models: list[dict[str, Any]] = field(default_factory=list)
+    mode: str = CONSENSUS_MODE_SEQUENTIAL
 
     def to_metadata(self) -> dict[str, Any]:
         """Return a JSON-serializable snapshot for conversation storage."""
         return {
-            "version": 1,
+            "version": 2,
             "original_proposal": self.original_proposal,
             "models_to_consult": self.models_to_consult,
             "relevant_files": self.relevant_files,
@@ -67,11 +105,14 @@ class ConsensusChainState:
             "work_history": self.work_history,
             "host_frontend": self.host_frontend,
             "host_skipped_models": self.host_skipped_models,
+            "mode": self.mode,
         }
 
     @classmethod
     def from_metadata(cls, metadata: dict[str, Any]) -> ConsensusChainState:
         """Restore a chain snapshot from conversation storage."""
+        stored_mode = metadata.get("mode")
+        restored_mode = stored_mode if stored_mode in CONSENSUS_MODES else CONSENSUS_MODE_SEQUENTIAL
         return cls(
             original_proposal=str(metadata.get("original_proposal") or ""),
             models_to_consult=list(metadata.get("models_to_consult") or []),
@@ -81,11 +122,18 @@ class ConsensusChainState:
             work_history=list(metadata.get("work_history") or []),
             host_frontend=str(metadata.get("host_frontend") or "unknown"),
             host_skipped_models=list(metadata.get("host_skipped_models") or []),
+            mode=restored_mode,
         )
 
 
 HOST_MODEL_SKIP_ALIASES = {
     "codex": {
+        "gpt-6-astra-pro",
+        "gpt6-astra-pro",
+        "gpt6astrapro",
+        "gpt-6-pro",
+        "gpt6-pro",
+        "astra-pro",
         "gpt-5.6-sol-pro",
         "gpt5.6-sol-pro",
         "gpt5.6solpro",
@@ -117,9 +165,28 @@ CONSENSUS_WORKFLOW_FIELD_DESCRIPTIONS = {
         "Consensus prompt. Step 1: write the exact proposal/question every model will see (use 'Evaluate…', not meta commentary). "
         "Steps 2+: capture internal notes about the latest model response—these notes are NOT sent to other models."
     ),
-    "step_number": "Current step index (starts at 1). Step 1 is your analysis; steps 2+ handle each model response.",
-    "total_steps": "Total steps = number of models consulted plus the final synthesis step.",
-    "next_step_required": "True if more model consultations remain; set false when ready to synthesize.",
+    "step_number": (
+        "Current step index (starts at 1). Parallel mode: always 1 — the whole panel is consulted in this call. "
+        "Sequential mode: step 1 is your analysis + the first model; steps 2+ handle each further model response."
+    ),
+    "total_steps": (
+        "Sequential mode: number of models consulted. Parallel mode: the server sets this to 1. "
+        "If you send mode 'parallel' you may still fill in the model count — the response tells you whether "
+        "the panel is complete."
+    ),
+    "next_step_required": (
+        "True if more model consultations remain; set false when ready to synthesize. "
+        "Parallel mode always returns false — stop and synthesize when you see it."
+    ),
+    "mode": (
+        "'parallel' (default): every model is consulted concurrently in this single call and the response carries "
+        "all verdicts in accumulated_responses; only step_number 1 is valid and a later step on the same "
+        "continuation_id is rejected. 'sequential': legacy one-model-per-step loop. Send mode explicitly together "
+        "with the normal step fields (step_number 1, total_steps = model count, next_step_required true) and stop "
+        "when the response reports consensus_complete or next_step_required false; otherwise continue the loop. "
+        "When mode is omitted and the request looks like a step loop (total_steps > 1 or next_step_required true), "
+        "the server runs sequentially."
+    ),
     "findings": (
         "Step 1: your independent analysis for later synthesis (not shared with other models). Steps 2+: summarize the newest model response."
     ),
@@ -127,7 +194,10 @@ CONSENSUS_WORKFLOW_FIELD_DESCRIPTIONS = {
     "models": (
         "User-specified list of models to consult (provide at least two entries). "
         "Each entry may include model, stance (for/against/neutral), and stance_prompt. "
-        "Each (model, stance) pair must be unique, e.g. [{'model':'gpt5','stance':'for'}, {'model':'pro','stance':'against'}]."
+        "Each (model, stance) pair must be unique, e.g. [{'model':'gpt5','stance':'for'}, {'model':'pro','stance':'against'}]. "
+        "CLI seats (configured in cli_seats.json, e.g. astra-cli, fable-cli) run through a subscription CLI in an "
+        "isolated prompt-only review and fall back to their configured API model; each leg's metadata.backend "
+        "records which answered."
     ),
     "current_model_index": "0-based index of the next model to consult (managed internally).",
     "model_responses": "Internal log of responses gathered so far.",
@@ -149,6 +219,9 @@ class ConsensusRequest(WorkflowRequest):
     confidence: str = Field(default="exploring", exclude=True, description="Not used")
 
     # Consensus-specific fields (only needed in step 1)
+    mode: Literal["parallel", "sequential"] | None = Field(
+        None, description=CONSENSUS_WORKFLOW_FIELD_DESCRIPTIONS["mode"]
+    )
     models: list[dict] | None = Field(None, description=CONSENSUS_WORKFLOW_FIELD_DESCRIPTIONS["models"])
     relevant_files: list[str] | None = Field(
         default_factory=list,
@@ -297,6 +370,11 @@ of the evidence, even when it strongly points in one direction.""",
                 "description": CONSENSUS_WORKFLOW_FIELD_DESCRIPTIONS["relevant_files"],
             },
             # consensus-specific fields (not in base workflow)
+            "mode": {
+                "type": "string",
+                "enum": list(CONSENSUS_MODES),
+                "description": CONSENSUS_WORKFLOW_FIELD_DESCRIPTIONS["mode"],
+            },
             "models": {
                 "type": "array",
                 "items": {
@@ -334,8 +412,16 @@ of the evidence, even when it strongly points in one direction.""",
         # Provide guidance on available models similar to single-model tools
         model_description = (
             "When the user names a model, you MUST use that exact value or report the "
-            "provider error—never swap in another option. Use the `listmodels` tool for the full roster."
+            "provider error—never swap in another option (a CLI seat's own configured API fallback is the only "
+            "substitution, and it is reported in metadata). Use the `listmodels` tool for the full roster."
         )
+        seat_registry = self._cli_seat_registry()
+        if seat_registry is not None and seat_registry.seats:
+            seat_summaries = "; ".join(
+                f"{seat.name} ({seat.client} CLI {seat.model} @ {seat.effort}, fallback {seat.fallback_model})"
+                for seat in seat_registry.seats
+            )
+            model_description = f"{model_description} CLI seats: {seat_summaries}."
 
         summaries, total, restricted = self._get_ranked_model_summaries()
         remainder = max(0, total - len(summaries))
@@ -482,14 +568,7 @@ of the evidence, even when it strongly points in one direction.""",
             "consensus_confidence": "high",  # Consensus complete
         }
 
-        response_data["next_steps"] = (
-            "CONSENSUS GATHERING IS COMPLETE. You MUST now synthesize all perspectives and present:\n"
-            "1. Key points of AGREEMENT across models\n"
-            "2. Key points of DISAGREEMENT and why they differ\n"
-            "3. Your final consolidated recommendation\n"
-            "4. Specific, actionable next steps for implementation\n"
-            "5. Critical risks or concerns that must be addressed"
-        )
+        response_data["next_steps"] = SYNTHESIS_NEXT_STEPS
 
         return response_data
 
@@ -529,7 +608,7 @@ of the evidence, even when it strongly points in one direction.""",
         return response_data
 
     async def execute_workflow(self, arguments: dict[str, Any]) -> list:
-        """Override execute_workflow to handle model consultations between steps."""
+        """Dispatch a consensus request to the parallel panel or the sequential step loop."""
 
         # Validate request
         request = self.get_workflow_request_model()(**arguments)
@@ -538,6 +617,18 @@ of the evidence, even when it strongly points in one direction.""",
         continuation_id = request.continuation_id
 
         if request.step_number == 1:
+            _registry, seat_config_error, declared_seat_names = self._cli_seat_state()
+            if seat_config_error is not None:
+                requested_seats = [
+                    str(model_config.get("model", ""))
+                    for model_config in (request.models or [])
+                    if str(model_config.get("model", "")).strip().lower() in declared_seat_names
+                ]
+                if requested_seats:
+                    raise ValueError(
+                        f"CLI seat configuration is invalid, so {', '.join(requested_seats)} cannot run: "
+                        f"{seat_config_error}"
+                    )
             (
                 filtered_models,
                 skipped_models,
@@ -558,6 +649,10 @@ of the evidence, even when it strongly points in one direction.""",
             request.models = filtered_models
             arguments["models"] = filtered_models
 
+            mode = self._resolve_mode(request)
+            request.mode = mode
+            arguments["mode"] = mode
+
             if not continuation_id:
                 clean_args = {k: v for k, v in arguments.items() if k not in ["_model_context", "_resolved_model_name"]}
                 continuation_id = create_thread(self.get_name(), clean_args)
@@ -571,20 +666,135 @@ of the evidence, even when it strongly points in one direction.""",
                 images=list(request.images or []),
                 host_frontend=frontend,
                 host_skipped_models=skipped_models,
+                mode=mode,
             )
-            # Set total steps: len(models) (each step includes consultation + response)
-            request.total_steps = len(chain_state.models_to_consult)
+            if mode == CONSENSUS_MODE_PARALLEL:
+                request.total_steps = 1
+                request.next_step_required = False
+            else:
+                # Set total steps: len(models) (each step includes consultation + response)
+                request.total_steps = len(chain_state.models_to_consult)
         else:
             if not continuation_id:
                 raise ValueError(f"Consensus step {request.step_number} requires a continuation_id")
             chain_state = self._restore_chain_state(continuation_id)
             if chain_state is None:
-                raise ValueError(
-                    f"Consensus state was not found for continuation_id '{continuation_id}'. "
-                    "Restart the consensus workflow at step 1."
+                raise ToolExecutionError(
+                    json.dumps(self._build_restore_miss_payload(request, continuation_id), ensure_ascii=False)
                 )
+
+            if request.mode and request.mode != chain_state.mode:
+                logger.warning(
+                    "Consensus step %s requested mode '%s' but the continuation was started in '%s' mode; "
+                    "using the stored mode",
+                    request.step_number,
+                    request.mode,
+                    chain_state.mode,
+                )
+            request.mode = chain_state.mode
+            arguments["mode"] = chain_state.mode
+
+            if chain_state.mode == CONSENSUS_MODE_PARALLEL:
+                raise ToolExecutionError(
+                    json.dumps(
+                        self._build_parallel_step_rejection_payload(request, continuation_id, chain_state),
+                        ensure_ascii=False,
+                    )
+                )
+
             request.total_steps = len(chain_state.models_to_consult)
 
+        if chain_state.mode == CONSENSUS_MODE_PARALLEL:
+            return await self._execute_parallel_panel(request, arguments, continuation_id, chain_state)
+
+        return await self._execute_sequential_step(request, arguments, continuation_id, chain_state)
+
+    def _resolve_mode(self, request) -> str:
+        """Pick the consultation mode for a step-1 request."""
+        if request.mode in CONSENSUS_MODES:
+            return request.mode
+
+        legacy_loop_signature = request.total_steps > 1 or bool(request.next_step_required)
+        if legacy_loop_signature:
+            logger.info(
+                "consensus: legacy step-loop signature (total_steps=%s, next_step_required=%s) — running sequential",
+                request.total_steps,
+                request.next_step_required,
+            )
+            return CONSENSUS_MODE_SEQUENTIAL
+
+        logger.info(
+            "consensus: mode omitted and request is not loop-shaped — consulting all %s models in parallel",
+            len(request.models or []),
+        )
+        return CONSENSUS_MODE_PARALLEL
+
+    def _build_restore_miss_payload(self, request, continuation_id: str) -> dict[str, Any]:
+        """Error payload for a continuation whose chain state is gone (e.g. server restarted)."""
+        return {
+            "status": "error",
+            "content": (
+                f"Consensus state for continuation_id '{continuation_id}' was not found (server restarted?). "
+                "If an earlier response reported consensus_complete or next_step_required false, synthesize from "
+                "its accumulated_responses — do NOT re-run the panel. If a sequential loop was interrupted part-way, "
+                "the verdicts you already hold are a partial panel: name the models that never answered rather than "
+                "re-running everything. Only start a new round at step_number 1 if you have no verdicts at all."
+            ),
+            "next_step_required": False,
+            "consensus_complete": False,
+            "metadata": {
+                "tool_name": self.get_name(),
+                "continuation_id": continuation_id,
+                "step_number": request.step_number,
+            },
+        }
+
+    def _build_parallel_step_rejection_payload(
+        self,
+        request,
+        continuation_id: str,
+        chain_state: ConsensusChainState,
+    ) -> dict[str, Any]:
+        """Error payload for a step >= 2 on a continuation whose panel already ran in parallel."""
+        panel = self._summarize_panel(chain_state, chain_state.accumulated_responses, deadline_seconds=None)
+        if panel["succeeded"] > 0:
+            guidance = "Do NOT re-run — synthesize from the accumulated_responses in this payload" + (
+                f" (a partial panel: {', '.join(panel['failed_models'])} did not answer; say so)."
+                if panel["failed"] > 0
+                else "."
+            )
+        else:
+            guidance = (
+                "That panel produced no successful verdict, so there is nothing to synthesize from these error "
+                "records; if you still need a review, start a new round at step_number 1."
+            )
+        return {
+            "status": "error",
+            "mode": CONSENSUS_MODE_PARALLEL,
+            "content": (
+                f"Consensus already ran the whole panel in parallel mode for continuation_id '{continuation_id}'; "
+                f"step_number {request.step_number} is not valid. {guidance}"
+            ),
+            "next_step_required": False,
+            "consensus_complete": panel["failed"] == 0 and panel["succeeded"] > 0,
+            "panel": panel,
+            "accumulated_responses": chain_state.accumulated_responses,
+            "metadata": {
+                "tool_name": self.get_name(),
+                "continuation_id": continuation_id,
+                "mode": CONSENSUS_MODE_PARALLEL,
+                "host_frontend": chain_state.host_frontend,
+            },
+        }
+
+    async def _execute_sequential_step(
+        self,
+        request,
+        arguments: dict[str, Any],
+        continuation_id: str | None,
+        chain_state: ConsensusChainState,
+    ) -> list:
+        """Consult exactly one model for this step (legacy one-model-per-step protocol)."""
         # For all steps (1 through total_steps), consult the corresponding model
         if request.step_number <= request.total_steps:
             # Calculate which model to consult for this step
@@ -639,14 +849,7 @@ of the evidence, even when it strongly points in one direction.""",
                         "total_responses": len(chain_state.accumulated_responses),
                         "consensus_confidence": "high",
                     }
-                    response_data["next_steps"] = (
-                        "CONSENSUS GATHERING IS COMPLETE. Synthesize all perspectives and present:\n"
-                        "1. Key points of AGREEMENT across models\n"
-                        "2. Key points of DISAGREEMENT and why they differ\n"
-                        "3. Your final consolidated recommendation\n"
-                        "4. Specific, actionable next steps for implementation\n"
-                        "5. Critical risks or concerns that must be addressed"
-                    )
+                    response_data["next_steps"] = SYNTHESIS_NEXT_STEPS
                 else:
                     response_data["next_steps"] = (
                         f"Model {model_response['model']} has provided its {model_response.get('stance', 'neutral')} "
@@ -673,6 +876,296 @@ of the evidence, even when it strongly points in one direction.""",
             f"Consensus step_number {request.step_number} exceeds the {request.total_steps} configured model steps"
         )
 
+    async def _execute_parallel_panel(
+        self,
+        request,
+        arguments: dict[str, Any],
+        continuation_id: str | None,
+        chain_state: ConsensusChainState,
+    ) -> list:
+        """Consult every panel model concurrently and return all verdicts in one response."""
+        step_data = self.prepare_step_data(request)
+        chain_state.work_history.append(step_data)
+
+        deadline_seconds = self._panel_deadline_seconds()
+        if not chain_state.models_to_consult:
+            empty_panel = self._summarize_panel(chain_state, [], deadline_seconds)
+            raise ToolExecutionError(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "mode": CONSENSUS_MODE_PARALLEL,
+                        "content": "Consensus has no models to consult after host policy was applied",
+                        "next_step_required": False,
+                        "consensus_complete": False,
+                        "panel": empty_panel,
+                        "accumulated_responses": [],
+                        "continuation_id": continuation_id,
+                        "metadata": {"tool_name": self.get_name(), "host_frontend": chain_state.host_frontend},
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+        deadline_at = time.monotonic() + deadline_seconds
+        seat_progress: dict[int, dict[str, Any]] = {}
+        tasks = [
+            asyncio.create_task(
+                self._consult_model(
+                    model_config,
+                    request,
+                    original_proposal=chain_state.original_proposal,
+                    relevant_files=chain_state.relevant_files,
+                    images=chain_state.images,
+                    deadline_at=deadline_at,
+                    seat_progress=seat_progress,
+                )
+            )
+            for model_config in chain_state.models_to_consult
+        ]
+
+        try:
+            _done, pending = await asyncio.wait(tasks, timeout=deadline_seconds)
+            await self._cancel_panel_tasks(pending)
+        except asyncio.CancelledError:
+            # Persist first, synchronously: a second cancellation must not be able to lose finished legs.
+            for task in tasks:
+                task.cancel()
+            results = self._collect_panel_results(
+                chain_state, tasks, deadline_seconds, unfinished_status="cancelled", seat_progress=seat_progress
+            )
+            self._store_partial_panel_after_cancel(
+                request, arguments, continuation_id, chain_state, results, deadline_seconds
+            )
+            try:
+                await self._cancel_panel_tasks(tasks)
+            except asyncio.CancelledError:
+                logger.info("consensus: cancelled again while draining panel legs; abandoning drain")
+            raise
+
+        results = self._collect_panel_results(
+            chain_state, tasks, deadline_seconds, unfinished_status="timed_out", seat_progress=seat_progress
+        )
+        chain_state.accumulated_responses = results
+
+        response_data = self._build_panel_response(request, chain_state, results, deadline_seconds)
+        response_data = self.customize_workflow_response(response_data, request, chain_state)
+        self._add_workflow_metadata(response_data, arguments)
+
+        panel = response_data["panel"]
+        response_data["metadata"]["consensus_complete"] = panel["failed"] == 0
+
+        if continuation_id:
+            self._store_chain_turn(continuation_id, response_data, chain_state)
+            continuation_offer = self._build_continuation_offer(continuation_id)
+            if continuation_offer:
+                response_data["continuation_offer"] = continuation_offer
+
+        if panel["succeeded"] == 0:
+            failure_payload = {
+                "status": "error",
+                "mode": CONSENSUS_MODE_PARALLEL,
+                "content": f"All {panel['consulted']} consensus models failed",
+                "next_step_required": False,
+                "consensus_complete": False,
+                "panel": panel,
+                "accumulated_responses": results,
+                "continuation_id": continuation_id,
+                "metadata": response_data.get("metadata", {}),
+            }
+            raise ToolExecutionError(json.dumps(failure_payload, ensure_ascii=False))
+
+        return [TextContent(type="text", text=json.dumps(response_data, indent=2, ensure_ascii=False))]
+
+    def _panel_deadline_seconds(self) -> float:
+        """Wall-clock budget for the parallel panel, from the environment or the default."""
+        raw_value = os.getenv(CONSENSUS_PANEL_DEADLINE_ENV, "").strip()
+        if not raw_value:
+            return DEFAULT_CONSENSUS_PANEL_DEADLINE_S
+        try:
+            parsed_value = float(raw_value)
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid %s=%r; using %ss",
+                CONSENSUS_PANEL_DEADLINE_ENV,
+                raw_value,
+                DEFAULT_CONSENSUS_PANEL_DEADLINE_S,
+            )
+            return DEFAULT_CONSENSUS_PANEL_DEADLINE_S
+        if not math.isfinite(parsed_value) or parsed_value <= 0:
+            logger.warning(
+                "Ignoring non-positive or non-finite %s=%r; using %ss",
+                CONSENSUS_PANEL_DEADLINE_ENV,
+                raw_value,
+                DEFAULT_CONSENSUS_PANEL_DEADLINE_S,
+            )
+            return DEFAULT_CONSENSUS_PANEL_DEADLINE_S
+        return parsed_value
+
+    async def _cancel_panel_tasks(self, tasks) -> None:
+        """Cancel unfinished legs and retrieve their exceptions so nothing is left dangling."""
+        unfinished = [task for task in tasks if not task.done()]
+        for task in unfinished:
+            task.cancel()
+        if not unfinished:
+            return
+        drained, still_pending = await asyncio.wait(unfinished, timeout=PANEL_DRAIN_TIMEOUT_S)
+        for task in drained:
+            if not task.cancelled():
+                task.exception()
+        if still_pending:
+            logger.warning(
+                "consensus: %s panel leg(s) did not acknowledge cancellation within %ss; leaving them to the "
+                "provider timeout",
+                len(still_pending),
+                PANEL_DRAIN_TIMEOUT_S,
+            )
+
+    def _collect_panel_results(
+        self,
+        chain_state: ConsensusChainState,
+        tasks,
+        deadline_seconds: float,
+        *,
+        unfinished_status: str,
+        seat_progress: dict[int, dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Map every leg to a result dict in roster order, whatever state its task ended in."""
+        progress_by_config = seat_progress if seat_progress is not None else {}
+        results: list[dict[str, Any]] = []
+        for model_config, task in zip(chain_state.models_to_consult, tasks):
+            model_name = model_config["model"]
+            stance = model_config.get("stance", "neutral")
+
+            if not task.done() or task.cancelled():
+                seat = self._resolve_cli_seat(model_name)
+                if unfinished_status != "timed_out":
+                    unfinished_error = "consultation cancelled before the model responded"
+                elif seat is not None:
+                    unfinished_error = (
+                        f"did not complete within panel deadline {deadline_seconds:g}s; the {seat.client} CLI process "
+                        "group was terminated (an API fallback call, if one had started, runs until its HTTP read "
+                        "timeout)"
+                    )
+                else:
+                    unfinished_error = (
+                        f"did not complete within panel deadline {deadline_seconds:g}s; provider call abandoned "
+                        "(thread runs until the HTTP read timeout, cost still incurred)"
+                    )
+                unfinished_result = {
+                    "model": model_name,
+                    "stance": stance,
+                    "status": unfinished_status,
+                    "error": unfinished_error,
+                }
+                if seat is not None:
+                    unfinished_result["metadata"] = self._unfinished_seat_metadata(
+                        seat, progress_by_config.get(id(model_config))
+                    )
+                results.append(unfinished_result)
+                continue
+
+            exception = task.exception()
+            if exception is not None:
+                results.append(
+                    {"model": model_name, "stance": stance, "status": "error", "error": describe_exception(exception)}
+                )
+                continue
+
+            results.append(task.result())
+        return results
+
+    def _summarize_panel(
+        self,
+        chain_state: ConsensusChainState,
+        results: list[dict[str, Any]],
+        deadline_seconds: float | None,
+    ) -> dict[str, Any]:
+        """Counts describing how much of the requested panel actually answered."""
+        consulted = len(chain_state.models_to_consult)
+        skipped = len(chain_state.host_skipped_models)
+        succeeded = [item for item in results if item.get("status") == "success"]
+        unsuccessful = [item for item in results if item.get("status") != "success"]
+        timed_out = [item for item in results if item.get("status") == "timed_out"]
+        cancelled = [item for item in results if item.get("status") == "cancelled"]
+        failed_models = [f"{item.get('model')}:{item.get('stance', 'neutral')}" for item in unsuccessful]
+        return {
+            "requested": consulted + skipped,
+            "consulted": consulted,
+            "succeeded": len(succeeded),
+            "failed": len(unsuccessful),
+            "timed_out": len(timed_out),
+            "cancelled": len(cancelled),
+            "skipped_by_host_policy": skipped,
+            "failed_models": failed_models,
+            "deadline_seconds": deadline_seconds,
+        }
+
+    def _build_panel_response(
+        self,
+        request,
+        chain_state: ConsensusChainState,
+        results: list[dict[str, Any]],
+        deadline_seconds: float,
+    ) -> dict[str, Any]:
+        """Response body for a parallel panel run (complete or partial)."""
+        panel = self._summarize_panel(chain_state, results, deadline_seconds)
+        complete = panel["failed"] == 0
+
+        next_steps = SYNTHESIS_NEXT_STEPS
+        if not complete:
+            next_steps = (
+                f"{SYNTHESIS_NEXT_STEPS}\n\n"
+                f"WARNING: {panel['failed']} of {panel['consulted']} models failed "
+                f"({', '.join(panel['failed_models'])}). Do not present the remaining responses as unanimous; "
+                "name the missing models."
+            )
+
+        return {
+            "status": "consensus_workflow_complete" if complete else "consensus_workflow_partial",
+            "mode": CONSENSUS_MODE_PARALLEL,
+            "step_number": 1,
+            "total_steps": 1,
+            "next_step_required": False,
+            "panel_size": panel["consulted"],
+            "panel": panel,
+            "agent_analysis": {
+                "initial_analysis": request.step,
+                "findings": request.findings,
+            },
+            "consensus_complete": complete,
+            "complete_consensus": {
+                "initial_prompt": chain_state.original_proposal,
+                "models_consulted": [
+                    f"{m['model']}:{m.get('stance', 'neutral')}" for m in chain_state.models_to_consult
+                ],
+                "total_responses": len(results),
+                "consensus_confidence": "high" if complete else "partial",
+            },
+            "next_steps": next_steps,
+        }
+
+    def _store_partial_panel_after_cancel(
+        self,
+        request,
+        arguments: dict[str, Any],
+        continuation_id: str | None,
+        chain_state: ConsensusChainState,
+        results: list[dict[str, Any]],
+        deadline_seconds: float,
+    ) -> None:
+        """Best-effort persistence of the legs that finished before the MCP call was cancelled."""
+        if not continuation_id:
+            return
+        try:
+            chain_state.accumulated_responses = results
+            response_data = self._build_panel_response(request, chain_state, results, deadline_seconds)
+            response_data = self.customize_workflow_response(response_data, request, chain_state)
+            self._add_workflow_metadata(response_data, arguments)
+            self._store_chain_turn(continuation_id, response_data, chain_state)
+        except Exception:
+            logger.exception("Failed to store partial consensus panel after cancellation")
+
     def _apply_host_model_skip_policy(self, models: list[dict]) -> tuple[list[dict], list[dict[str, Any]], str]:
         """Remove models that should not be consulted from the current frontend."""
         frontend = get_current_client_frontend()
@@ -682,6 +1175,20 @@ of the evidence, even when it strongly points in one direction.""",
         for model_config in models:
             model_name = str(model_config.get("model", "")).strip()
             normalized_model_name = model_name.lower()
+            seat = self._resolve_cli_seat(model_name)
+            if seat is not None:
+                if str(frontend).strip().lower() in seat.host_dedup_frontends:
+                    skipped_models.append(
+                        {
+                            "model": model_name,
+                            "stance": model_config.get("stance", "neutral"),
+                            "frontend": frontend,
+                        }
+                    )
+                else:
+                    filtered_models.append(model_config)
+                continue
+
             skip_for_capability = False
             try:
                 provider = self.get_model_provider(model_name)
@@ -783,8 +1290,66 @@ of the evidence, even when it strongly points in one direction.""",
         original_proposal: str | None = None,
         relevant_files: list[str] | None = None,
         images: list[str] | None = None,
+        deadline_at: float | None = None,
+        seat_progress: dict[int, dict[str, Any]] | None = None,
     ) -> dict:
-        """Consult a single model and return its response."""
+        """Consult a single panel seat: a CLI seat when the name is registered as one, otherwise an API model."""
+        seat = self._resolve_cli_seat(model_config.get("model"))
+        if seat is not None:
+            return await self._consult_cli_seat(
+                seat,
+                model_config,
+                request,
+                original_proposal=original_proposal,
+                relevant_files=relevant_files,
+                images=images,
+                deadline_at=deadline_at,
+                seat_progress=seat_progress,
+            )
+        return await self._consult_api_model(
+            model_config,
+            request,
+            original_proposal=original_proposal,
+            relevant_files=relevant_files,
+            images=images,
+        )
+
+    def _build_blinded_prompt(
+        self,
+        model_context,
+        request,
+        *,
+        original_proposal: str | None,
+        relevant_files: list[str] | None,
+    ) -> str:
+        """Build the blinded consultation prompt shared by API and CLI legs."""
+        # Use continuation_id=None for blinded consensus - each model should only see
+        # original prompt + files, not conversation history or other model responses
+        # CRITICAL: Use the original proposal from step 1, NOT what's in request.step for steps 2+!
+        # Steps 2+ contain summaries/notes that must NEVER be sent to other models
+        prompt = original_proposal or request.step
+        files_for_consultation = relevant_files if relevant_files is not None else request.relevant_files
+        if files_for_consultation:
+            file_content, _ = self._prepare_file_content_for_prompt(
+                files_for_consultation,
+                None,  # Use None instead of request.continuation_id for blinded consensus
+                "Context files",
+                model_context=model_context,
+            )
+            if file_content:
+                prompt = f"{prompt}\n\n=== CONTEXT FILES ===\n{file_content}\n=== END CONTEXT ==="
+        return prompt
+
+    async def _consult_api_model(
+        self,
+        model_config: dict,
+        request,
+        *,
+        original_proposal: str | None = None,
+        relevant_files: list[str] | None = None,
+        images: list[str] | None = None,
+    ) -> dict:
+        """Consult a single API model and return its response."""
         try:
             # Import and create ModelContext once at the beginning
             from utils.model_context import ModelContext
@@ -796,22 +1361,12 @@ of the evidence, even when it strongly points in one direction.""",
             # Create model context once and reuse for both file processing and temperature validation
             model_context = ModelContext(model_name=model_name)
 
-            # Prepare the prompt with any relevant files
-            # Use continuation_id=None for blinded consensus - each model should only see
-            # original prompt + files, not conversation history or other model responses
-            # CRITICAL: Use the original proposal from step 1, NOT what's in request.step for steps 2+!
-            # Steps 2+ contain summaries/notes that must NEVER be sent to other models
-            prompt = original_proposal or request.step
-            files_for_consultation = relevant_files if relevant_files is not None else request.relevant_files
-            if files_for_consultation:
-                file_content, _ = self._prepare_file_content_for_prompt(
-                    files_for_consultation,
-                    None,  # Use None instead of request.continuation_id for blinded consensus
-                    "Context files",
-                    model_context=model_context,
-                )
-                if file_content:
-                    prompt = f"{prompt}\n\n=== CONTEXT FILES ===\n{file_content}\n=== END CONTEXT ==="
+            prompt = self._build_blinded_prompt(
+                model_context,
+                request,
+                original_proposal=original_proposal,
+                relevant_files=relevant_files,
+            )
 
             # Get stance-specific system prompt
             stance = model_config.get("stance", "neutral")
@@ -866,6 +1421,166 @@ of the evidence, even when it strongly points in one direction.""",
                 "status": "error",
                 "error": str(e),
             }
+
+    def _resolves_as_api_model(self, model_name: str) -> bool:
+        try:
+            provider = self.get_model_provider(model_name)
+            provider.get_capabilities(model_name)
+        except Exception:
+            return False
+        return True
+
+    def _cli_seat_state(self) -> tuple[CLISeatRegistry | None, CLISeatConfigError | None, frozenset[str]]:
+        """Shared seat registry state; see ``tools.consensus_cli_seats.get_cli_seat_state``."""
+        return get_cli_seat_state(self._resolves_as_api_model)
+
+    def _cli_seat_registry(self) -> CLISeatRegistry | None:
+        return self._cli_seat_state()[0]
+
+    def _resolve_cli_seat(self, model_name: str | None) -> CLISeat | None:
+        registry = self._cli_seat_registry()
+        if registry is None:
+            return None
+        return registry.resolve(model_name)
+
+    def _cli_seat_base_metadata(self, seat: CLISeat) -> dict[str, Any]:
+        return {
+            "requested_model_name": seat.name,
+            "cli_seat": seat.name,
+            "cli_client": seat.client,
+            "cli_model": seat.model,
+            "fallback_model": seat.fallback_model,
+            "requested_reasoning_effort": seat.effort,
+        }
+
+    def _unfinished_seat_metadata(self, seat: CLISeat, progress: dict[str, Any] | None) -> dict[str, Any]:
+        """Metadata for a seat leg that was cancelled or timed out, including attempts recorded so far."""
+        progress = progress or {}
+        started = progress.get("started")
+        return {
+            **self._cli_seat_base_metadata(seat),
+            "backend": progress.get("backend", "cli"),
+            "effective_reasoning_effort": None,
+            "attempts": list(progress.get("attempts") or []),
+            "duration_seconds": round(time.monotonic() - started, 3) if started is not None else None,
+        }
+
+    async def _consult_cli_seat(
+        self,
+        seat: CLISeat,
+        model_config: dict,
+        request,
+        *,
+        original_proposal: str | None,
+        relevant_files: list[str] | None,
+        images: list[str] | None,
+        deadline_at: float | None,
+        seat_progress: dict[int, dict[str, Any]] | None = None,
+    ) -> dict:
+        """Run a CLI seat, falling back to its API model when the CLI cannot produce a verdict."""
+        from utils.model_context import ModelContext
+
+        stance = model_config.get("stance", "neutral")
+        base_metadata = self._cli_seat_base_metadata(seat)
+        effective_images = images if images is not None else (request.images or None)
+
+        def build_prompt() -> str:
+            return self._build_blinded_prompt(
+                ModelContext(model_name=seat.fallback_model),
+                request,
+                original_proposal=original_proposal,
+                relevant_files=relevant_files,
+            )
+
+        async def api_fallback() -> dict[str, Any]:
+            fallback_config = {**model_config, "model": seat.fallback_model}
+            fallback_result = await self._consult_api_model(
+                fallback_config,
+                request,
+                original_proposal=original_proposal,
+                relevant_files=relevant_files,
+                images=images,
+            )
+            return {
+                "status": fallback_result.get("status"),
+                "text": fallback_result.get("verdict", ""),
+                "metadata": fallback_result.get("metadata") or {},
+                "error": fallback_result.get("error"),
+            }
+
+        progress: dict[str, Any] = {}
+        if seat_progress is not None:
+            seat_progress[id(model_config)] = progress
+        outcome = await consult_seat_with_fallback(
+            seat,
+            system_prompt=self._get_stance_enhanced_prompt(stance, model_config.get("stance_prompt")),
+            build_prompt=build_prompt,
+            deadline_at=deadline_at,
+            api_fallback=api_fallback,
+            images_present=bool(effective_images),
+            runner=run_cli_seat,
+            enforce_fallback_deadline=True,
+            progress=progress,
+        )
+
+        if outcome.status == "success" and outcome.backend == "cli":
+            metadata = {
+                **base_metadata,
+                "provider": "cli",
+                "backend": "cli",
+                "model_name": outcome.model_used,
+                "provider_model_name": f"{seat.client}:{outcome.model_used}",
+                "effective_reasoning_effort": seat.effort,
+                "fallback_reason": None,
+                "attempts": outcome.attempts,
+                "duration_seconds": outcome.duration_seconds,
+            }
+            if outcome.usage:
+                metadata["usage"] = outcome.usage
+            return {
+                "model": seat.name,
+                "stance": stance,
+                "status": "success",
+                "verdict": outcome.text,
+                "metadata": metadata,
+            }
+
+        if outcome.status == "success":
+            metadata = {
+                **((outcome.fallback_payload or {}).get("metadata") or {}),
+                **base_metadata,
+                "backend": "api_fallback",
+                "fallback_reason": outcome.fallback_reason,
+                "effective_reasoning_effort": None,
+                "attempts": outcome.attempts,
+                "duration_seconds": outcome.duration_seconds,
+            }
+            if outcome.cli_error:
+                metadata["cli_error"] = outcome.cli_error
+            return {
+                "model": seat.name,
+                "stance": stance,
+                "status": "success",
+                "verdict": outcome.text,
+                "metadata": metadata,
+            }
+
+        return {
+            "model": seat.name,
+            "stance": stance,
+            "status": "error",
+            "error": outcome.error,
+            "metadata": {
+                **((outcome.fallback_payload or {}).get("metadata") or {}),
+                **base_metadata,
+                "backend": outcome.backend,
+                "fallback_reason": outcome.fallback_reason,
+                "effective_reasoning_effort": None,
+                "cli_error": outcome.cli_error,
+                "attempts": outcome.attempts,
+                "duration_seconds": outcome.duration_seconds,
+            },
+        }
 
     def _get_stance_enhanced_prompt(self, stance: str, custom_stance_prompt: str | None = None) -> str:
         """Get the system prompt with stance injection."""
@@ -956,7 +1671,9 @@ of the evidence, even when it strongly points in one direction.""",
             response_data["accumulated_responses"] = chain_state.accumulated_responses
 
         # Add consensus-specific fields
-        if request.step_number == 1:
+        if chain_state and chain_state.mode == CONSENSUS_MODE_PARALLEL:
+            response_data["consensus_workflow_status"] = "ready_for_synthesis"
+        elif request.step_number == 1:
             response_data["consensus_workflow_status"] = "initial_analysis_complete"
         elif request.step_number < request.total_steps - 1:
             response_data["consensus_workflow_status"] = "consulting_models"
@@ -989,6 +1706,7 @@ of the evidence, even when it strongly points in one direction.""",
         # Always preserve tool_name
         metadata["tool_name"] = self.get_name()
         metadata["host_frontend"] = chain_state.host_frontend if chain_state else "unknown"
+        metadata["mode"] = chain_state.mode if chain_state else CONSENSUS_MODE_SEQUENTIAL
 
         if chain_state and chain_state.host_skipped_models:
             metadata["models_skipped_by_host_policy"] = chain_state.host_skipped_models

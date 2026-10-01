@@ -623,6 +623,14 @@ class BaseTool(ABC):
         """
         return "medium"  # Default to medium thinking for better reasoning
 
+    def resolve_thinking_mode(self, request_value, capabilities, fallback) -> str:
+        if request_value is not None:
+            return request_value
+        default_thinking_mode = getattr(capabilities, "default_thinking_mode", None)
+        if default_thinking_mode is not None:
+            return default_thinking_mode
+        return fallback
+
     def get_model_category(self) -> "ToolModelCategory":
         """
         Return the model category for this tool.

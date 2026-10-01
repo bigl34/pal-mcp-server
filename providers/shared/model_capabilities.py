@@ -56,6 +56,7 @@ class ModelCapabilities:
     use_openai_response_api: bool = False
     default_reasoning_mode: Optional[Literal["standard", "pro"]] = None
     default_reasoning_effort: Optional[str] = None
+    default_thinking_mode: Optional[str] = None
     host_dedup_frontends: list[str] = field(default_factory=list)
     allow_code_generation: bool = (
         False  # Enables structured code generation in chat tool for substantial implementations
@@ -70,6 +71,8 @@ class ModelCapabilities:
     def __post_init__(self) -> None:
         if self.default_reasoning_mode not in {None, "standard", "pro"}:
             raise ValueError("default_reasoning_mode must be one of: standard, pro")
+        if self.default_thinking_mode not in (None, "minimal", "low", "medium", "high", "max"):
+            raise ValueError("default_thinking_mode must be one of: minimal, low, medium, high, max")
 
     def get_effective_temperature(self, requested_temperature: float) -> Optional[float]:
         """Return the temperature that should be sent to the provider.

@@ -126,6 +126,20 @@ class OpenRouterProvider(OpenAICompatibleProvider):
 
         return bool(entry and entry.get("allow_non_zdr") is True)
 
+    def _openrouter_provider_only(self, model_name: str | None) -> list[str] | None:
+        """Read the configured OpenRouter provider allowlist for a model."""
+
+        if not model_name or not self._registry:
+            return None
+
+        entry = self._registry.get_entry(model_name)
+        if entry is None:
+            config = self._registry.resolve(model_name)
+            if config:
+                entry = self._registry.get_entry(config.model_name)
+
+        return entry.get("provider_only") if entry else None
+
     def _is_fusion_model(self, model_name: str | None) -> bool:
         """Return True when a request targets OpenRouter Fusion."""
 

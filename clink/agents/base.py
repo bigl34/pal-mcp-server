@@ -22,6 +22,7 @@ from clink.parsers import BaseParser, ParsedCLIResponse, ParserError, get_parser
 logger = logging.getLogger("clink.agent")
 
 PROCESS_TERMINATION_GRACE_SECONDS = 2.0
+PROCESS_KILL_REAP_SECONDS = 2.0
 
 
 @dataclass
@@ -163,7 +164,7 @@ class BaseCLIAgent:
                 timeout=self.client.timeout_seconds,
             )
         except asyncio.TimeoutError as exc:
-            stdout_bytes, stderr_bytes, termination_metadata = await self._terminate_process_group(
+            stdout_bytes, stderr_bytes, termination_metadata = await self._terminate_uncancellable(
                 process,
                 communicate_task,
                 reason="timeout",
@@ -181,9 +182,13 @@ class BaseCLIAgent:
             ) from exc
         except asyncio.CancelledError:
             # MCP request cancellation must not strand the delegated CLI or any
-            # child it spawned. Complete group cleanup before propagating.
-            await self._terminate_process_group(process, communicate_task, reason="cancelled")
+            # child it spawned. Complete group cleanup before propagating, even if
+            # the caller cancels again while the bounded cleanup is still running.
+            await self._terminate_uncancellable(process, communicate_task, reason="cancelled")
             raise
+
+        if self._process_group_alive(process):
+            await self._terminate_uncancellable(process, communicate_task, reason="post_exit_sweep")
 
         duration = time.monotonic() - start_time
         return_code = process.returncode
@@ -258,6 +263,40 @@ class BaseCLIAgent:
             return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
         return {}
 
+    async def _terminate_uncancellable(
+        self,
+        process: asyncio.subprocess.Process,
+        communicate_task: asyncio.Task[tuple[bytes, bytes]],
+        *,
+        reason: str,
+    ) -> tuple[bytes, bytes, dict[str, object]]:
+        """Run the bounded group cleanup to completion even if the caller is cancelled meanwhile."""
+        cleanup_task = asyncio.create_task(self._terminate_process_group(process, communicate_task, reason=reason))
+        cancelled_during_cleanup = False
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                cancelled_during_cleanup = True
+        result = cleanup_task.result()
+        if cancelled_during_cleanup:
+            raise asyncio.CancelledError()
+        return result
+
+    def _process_group_alive(self, process: asyncio.subprocess.Process) -> bool:
+        if os.name != "posix":
+            return process.returncode is None
+        process_id = getattr(process, "pid", None)
+        if not isinstance(process_id, int) or process_id <= 1:
+            return False
+        try:
+            os.killpg(process_id, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return False
+        return True
+
     async def _terminate_process_group(
         self,
         process: asyncio.subprocess.Process,
@@ -282,8 +321,8 @@ class BaseCLIAgent:
         stderr_bytes = b""
 
         try:
-            if process.returncode is None and not communicate_task.done():
-                metadata["term_sent"] = self._signal_process_group(process, signal.SIGTERM)
+            metadata["term_sent"] = self._signal_process_group(process, signal.SIGTERM)
+            grace_deadline = time.monotonic() + PROCESS_TERMINATION_GRACE_SECONDS
 
             try:
                 stdout_bytes, stderr_bytes = await asyncio.wait_for(
@@ -291,14 +330,32 @@ class BaseCLIAgent:
                     timeout=PROCESS_TERMINATION_GRACE_SECONDS,
                 )
             except asyncio.TimeoutError:
+                pass
+
+            # The streams can finish while TERM-ignoring children that closed or
+            # redirected their pipes live on, so escalation follows group liveness.
+            while self._process_group_alive(process) and time.monotonic() < grace_deadline:
+                await asyncio.sleep(0.05)
+
+            if not communicate_task.done() or self._process_group_alive(process):
                 metadata["kill_escalated"] = True
                 self._signal_process_group(process, signal.SIGKILL)
-                stdout_bytes, stderr_bytes = await asyncio.shield(communicate_task)
+                try:
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                        asyncio.shield(communicate_task),
+                        timeout=PROCESS_KILL_REAP_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    metadata["streams_abandoned"] = True
+                    communicate_task.cancel()
         finally:
             # communicate() normally performs the wait itself. The explicit wait
             # makes the reap guarantee visible and covers stream-task failures.
             if process.returncode is None:
-                await process.wait()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=PROCESS_KILL_REAP_SECONDS)
+                except asyncio.TimeoutError:
+                    metadata["reap_timed_out"] = True
             metadata["reap_confirmed"] = process.returncode is not None
             metadata["final_return_code"] = process.returncode
 
@@ -313,8 +370,12 @@ class BaseCLIAgent:
         return stdout_bytes, stderr_bytes, metadata
 
     def _signal_process_group(self, process: asyncio.subprocess.Process, sig: signal.Signals) -> bool:
-        """Signal the owned group, falling back to the direct process off POSIX."""
-        if process.returncode is not None:
+        """Signal the owned group, falling back to the direct process off POSIX.
+
+        On POSIX the group is signalled even after the leader has exited, because
+        children that inherited the leader's session can outlive it and hold the pipes open.
+        """
+        if os.name != "posix" and process.returncode is not None:
             return False
         try:
             if os.name == "posix":
@@ -324,7 +385,7 @@ class BaseCLIAgent:
             else:  # pragma: no cover - exercised on Windows
                 process.kill()
             return True
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             return False
 
     def _build_command(

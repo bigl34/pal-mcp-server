@@ -794,6 +794,17 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[TextCon
     except Exception:
         pass
 
+    # Reject what a CLI seat cannot honour before continuation reconstruction writes to the thread
+    seat_request_error = cli_seat_request_error(TOOLS.get(name), arguments)
+    if seat_request_error:
+        error_output = ToolOutput(
+            status="error",
+            content=seat_request_error,
+            content_type="text",
+            metadata={"tool_name": name, "requested_model": arguments.get("model")},
+        )
+        raise ToolExecutionError(error_output.model_dump_json())
+
     # Handle thread context reconstruction if continuation_id is present
     if "continuation_id" in arguments and arguments["continuation_id"]:
         continuation_id = arguments["continuation_id"]
@@ -857,8 +868,26 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[TextCon
             # Update arguments with resolved model
             arguments["model"] = model_name
 
+        # A subscription CLI seat is budgeted and validated against its API fallback model
+        context_model_name = model_name
+        resolve_cli_seat = getattr(tool, "resolve_cli_seat", None)
+        if resolve_cli_seat is not None:
+            try:
+                seat = resolve_cli_seat(model_name)
+            except ValueError as exc:
+                error_output = ToolOutput(
+                    status="error",
+                    content=str(exc),
+                    content_type="text",
+                    metadata={"tool_name": name, "requested_model": model_name},
+                )
+                raise ToolExecutionError(error_output.model_dump_json()) from exc
+            if seat is not None:
+                context_model_name = seat.fallback_model
+                logger.info(f"Model '{model_name}' is CLI seat '{seat.name}' (fallback {context_model_name})")
+
         # Validate model availability at MCP boundary
-        provider = ModelProviderRegistry.get_provider_for_model(model_name)
+        provider = ModelProviderRegistry.get_provider_for_model(context_model_name)
         if not provider:
             # Get list of available models for error message
             available_models = list(ModelProviderRegistry.get_available_models(respect_restrictions=True).keys())
@@ -880,7 +909,7 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[TextCon
             raise ToolExecutionError(error_output.model_dump_json())
 
         # Create model context with resolved model and option
-        model_context = ModelContext(model_name, model_option)
+        model_context = ModelContext(context_model_name, model_option)
         arguments["_model_context"] = model_context
         arguments["_resolved_model_name"] = model_name
         logger.debug(
@@ -894,7 +923,7 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[TextCon
         argument_files = arguments.get("absolute_file_paths")
         if argument_files:
             logger.debug(f"Checking file sizes for {len(argument_files)} files with model {model_name}")
-            file_size_check = check_total_file_size(argument_files, model_name)
+            file_size_check = check_total_file_size(argument_files, context_model_name)
             if file_size_check:
                 logger.warning(f"File size check failed for {name} with model {model_name}")
                 raise ToolExecutionError(ToolOutput(**file_size_check).model_dump_json())
@@ -914,6 +943,29 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[TextCon
     # Handle unknown tool requests gracefully
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
+
+
+def cli_seat_request_error(tool, arguments: dict[str, Any]) -> Optional[str]:
+    """Return why a request naming a CLI seat cannot run, or None when it can (or names no seat)."""
+    resolve_cli_seat = getattr(tool, "resolve_cli_seat", None)
+    requested_model = arguments.get("model")
+    if resolve_cli_seat is None or not requested_model:
+        return None
+    base_model, model_option = parse_model_option(requested_model)
+    try:
+        seat = resolve_cli_seat(base_model)
+    except ValueError as exc:
+        return str(exc)
+    if seat is None:
+        return None
+    if model_option:
+        return f"CLI seat '{seat.name}' takes no ':{model_option}' suffix; set thinking_mode instead."
+    if arguments.get("continuation_id"):
+        return (
+            f"CLI seat '{seat.name}' is single-shot: continuation_id is not supported. "
+            "Start a new call with the full context inlined or passed via absolute_file_paths."
+        )
+    return None
 
 
 def parse_model_option(model_string: str) -> tuple[str, Optional[str]]:

@@ -1,11 +1,13 @@
 """Tests for OpenRouter provider."""
 
+import json
 import os
 from unittest.mock import Mock, patch
 
 import pytest
 
 from providers.openrouter import OpenRouterProvider
+from providers.registries.openrouter import OpenRouterModelRegistry
 from providers.registry import ModelProviderRegistry
 from providers.shared import ProviderType
 
@@ -110,6 +112,67 @@ class TestOpenRouterProvider:
         # Test unknown models pass through
         assert provider._resolve_model_name("unknown-model") == "unknown-model"
         assert provider._resolve_model_name("custom/model-v2") == "custom/model-v2"
+
+    def test_provider_only_request_options_are_alias_aware(self, tmp_path):
+        """Test provider pinning composes with existing OpenRouter routing options."""
+        config_path = tmp_path / "openrouter_models.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "provider_preferences": {"ignore": ["novita"]},
+                    "models": [
+                        {
+                            "model_name": "test/pinned-model",
+                            "aliases": ["pinned"],
+                            "provider_only": ["together", "fireworks"],
+                        },
+                        {
+                            "model_name": "test/default-model",
+                            "aliases": ["default"],
+                        },
+                        {
+                            "model_name": "test/non-zdr-model",
+                            "aliases": ["non-zdr"],
+                            "allow_non_zdr": True,
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        provider = OpenRouterProvider(api_key="test-key")
+        provider._registry = OpenRouterModelRegistry(config_path=str(config_path))
+
+        pinned_options = {
+            "extra_body": {
+                "provider": {
+                    "data_collection": "deny",
+                    "zdr": True,
+                    "ignore": ["novita"],
+                    "only": ["together", "fireworks"],
+                    "allow_fallbacks": False,
+                }
+            }
+        }
+        assert provider._provider_request_options("test/pinned-model") == pinned_options
+        assert provider._provider_request_options("pinned") == pinned_options
+        assert provider._provider_request_options("default") == {
+            "extra_body": {
+                "provider": {
+                    "data_collection": "deny",
+                    "zdr": True,
+                    "ignore": ["novita"],
+                }
+            }
+        }
+        assert provider._provider_request_options("non-zdr") == {
+            "extra_body": {
+                "provider": {
+                    "data_collection": "deny",
+                    "ignore": ["novita"],
+                }
+            }
+        }
 
     def test_openrouter_registration(self):
         """Test OpenRouter can be registered and retrieved."""

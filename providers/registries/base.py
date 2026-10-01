@@ -61,9 +61,17 @@ class CustomModelRegistryBase:
     def reload(self) -> None:
         data = self._load_config_data()
         settings = self._parse_settings(data)
-        configs = [config for config in self._parse_models(data) if config is not None]
-        self._build_maps(configs)
+        previous_settings = self._settings_snapshot()
+        previous_extras = self._extras
         self._apply_settings(settings)
+        self._extras = {}
+        try:
+            configs = [config for config in self._parse_models(data) if config is not None]
+            self._build_maps(configs)
+        except Exception:
+            self._extras = previous_extras
+            self._apply_settings(previous_settings)
+            raise
 
     def _parse_settings(self, data: dict) -> object | None:
         """Hook for registries that validate top-level settings beside ``models``."""
@@ -71,8 +79,11 @@ class CustomModelRegistryBase:
         return None
 
     def _apply_settings(self, settings: object | None) -> None:
-        """Hook that commits validated settings once the model maps are rebuilt."""
+        """Hook that applies validated settings before model entries are finalised."""
 
+        return None
+
+    def _settings_snapshot(self) -> object | None:
         return None
 
     def list_models(self) -> list[str]:

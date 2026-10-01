@@ -152,20 +152,25 @@ class ZenSafetyPolicy:
 
     def validate_config_entry(self, entry: dict[str, Any]) -> dict[str, Any]:
         model_id = str(entry.get("model_name") or "")
+        wire_id = str(entry.get("provider_model_name") or entry.get("model_name") or "")
         aliases = entry.get("aliases") or []
         if isinstance(aliases, str):
             aliases = [aliases]
 
-        if self.is_free_like(model_id) or any(self.is_free_like(str(alias)) for alias in aliases):
-            raise ValueError(f"Zen model '{model_id}' has a free-looking model ID or alias")
+        model_label = f"Zen model '{model_id}'"
+        if wire_id != model_id:
+            model_label = f"{model_label} (wire id '{wire_id}')"
 
-        record = self.get_record(model_id)
+        if self.is_free_like(wire_id) or any(self.is_free_like(str(alias)) for alias in aliases):
+            raise ValueError(f"{model_label} has a free-looking wire ID or alias")
+
+        record = self.get_record(wire_id)
         if record is None:
-            raise ValueError(f"Zen safety manifest has no fresh entry for '{model_id}'")
+            raise ValueError(f"Zen safety manifest has no fresh entry for '{wire_id}' ({model_label})")
 
         if not record.runtime_allowed:
             reason = "; ".join(record.reasons) if record.reasons else "classified as unsafe"
-            raise ValueError(f"Zen model '{model_id}' is not runtime allowed: {reason}")
+            raise ValueError(f"{model_label} is not runtime allowed: {reason}")
 
         billing_tier = str(entry.get("billing_tier") or "unknown")
         retention_policy = str(entry.get("retention_policy") or "unknown")
@@ -174,36 +179,35 @@ class ZenSafetyPolicy:
         openrouter_equivalents = entry.get("openrouter_equivalents") or []
 
         if billing_tier != "paid" or record.billing_tier != "paid":
-            raise ValueError(f"Zen model '{model_id}' is not positively classified as paid")
+            raise ValueError(f"{model_label} is not positively classified as paid")
 
         if retention_policy not in RUNTIME_RETENTION_POLICIES:
-            raise ValueError(f"Zen model '{model_id}' has unsupported retention policy '{retention_policy}'")
+            raise ValueError(f"{model_label} has unsupported retention policy '{retention_policy}'")
 
         if record.retention_policy not in RUNTIME_RETENTION_POLICIES:
             raise ValueError(
-                f"Zen model '{model_id}' has unsafe retention policy in safety manifest: {record.retention_policy}"
+                f"{model_label} has unsafe retention policy in safety manifest: {record.retention_policy}"
             )
 
         if retention_policy == "zero" and record.retention_policy != "zero":
             raise ValueError(
-                f"Zen model '{model_id}' config claims zero retention but live safety policy says "
-                f"{record.retention_policy}"
+                f"{model_label} config claims zero retention but live safety policy says {record.retention_policy}"
             )
 
         if endpoint_family not in SUPPORTED_RUNTIME_ENDPOINTS:
-            raise ValueError(f"Zen model '{model_id}' uses unsupported endpoint family '{endpoint_family}'")
+            raise ValueError(f"{model_label} uses unsupported endpoint family '{endpoint_family}'")
 
         if fallback_eligible:
             if retention_policy != "zero" or record.retention_policy != "zero":
-                raise ValueError(f"Zen model '{model_id}' is not eligible for ZDR fallback")
+                raise ValueError(f"{model_label} is not eligible for ZDR fallback")
             if endpoint_family not in SUPPORTED_FALLBACK_ENDPOINTS:
                 raise ValueError(
-                    f"Zen model '{model_id}' uses unsupported endpoint family '{endpoint_family}' for ZDR fallback"
+                    f"{model_label} uses unsupported endpoint family '{endpoint_family}' for ZDR fallback"
                 )
             if not record.zdr_fallback_eligible:
-                raise ValueError(f"Zen model '{model_id}' is not ZDR fallback eligible in safety manifest")
+                raise ValueError(f"{model_label} is not ZDR fallback eligible in safety manifest")
             if not isinstance(openrouter_equivalents, list):
-                raise ValueError(f"Zen model '{model_id}' openrouter_equivalents must be a list")
+                raise ValueError(f"{model_label} openrouter_equivalents must be a list")
 
         return {
             "endpoint_family": endpoint_family,

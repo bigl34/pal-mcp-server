@@ -3,6 +3,63 @@
 from utils.zen_safety import ZenSafetyPolicy
 
 
+def _policy_with_manifest(models):
+    policy = ZenSafetyPolicy.__new__(ZenSafetyPolicy)
+    policy.manifest = {"models": models}
+    return policy
+
+
+def _safe_record(model_id: str):
+    return {
+        "model_id": model_id,
+        "display_name": "GPT 5.5",
+        "billing_tier": "paid",
+        "retention_policy": "retained_30d",
+        "runtime_allowed": True,
+        "zdr_fallback_eligible": False,
+        "reasons": ["OpenAI API requests are retained for 30 days"],
+    }
+
+
+def test_validate_config_entry_uses_provider_model_name_for_safety_lookup():
+    policy = _policy_with_manifest({"gpt-5.5": _safe_record("gpt-5.5")})
+    entry = {
+        "model_name": "zen/gpt-5.5",
+        "provider_model_name": "gpt-5.5",
+        "aliases": ["zen-gpt5.5", "zen-gpt55"],
+        "endpoint_family": "responses",
+        "billing_tier": "paid",
+        "retention_policy": "retained_30d",
+        "zdr_fallback_eligible": False,
+        "openrouter_equivalents": ["openai/gpt-5.5"],
+    }
+
+    extras = policy.validate_config_entry(entry)
+
+    assert extras["endpoint_family"] == "responses"
+    assert extras["billing_tier"] == "paid"
+    assert extras["retention_policy"] == "retained_30d"
+
+
+def test_validate_config_entry_falls_back_to_model_name_for_legacy_shape():
+    policy = _policy_with_manifest({"gpt-5.5": _safe_record("gpt-5.5")})
+    entry = {
+        "model_name": "gpt-5.5",
+        "aliases": ["zen-gpt5.5", "zen-gpt55"],
+        "endpoint_family": "responses",
+        "billing_tier": "paid",
+        "retention_policy": "retained_30d",
+        "zdr_fallback_eligible": False,
+        "openrouter_equivalents": ["openai/gpt-5.5"],
+    }
+
+    extras = policy.validate_config_entry(entry)
+
+    assert extras["endpoint_family"] == "responses"
+    assert extras["billing_tier"] == "paid"
+    assert extras["retention_policy"] == "retained_30d"
+
+
 def test_build_manifest_marks_new_docs_free_model_unsafe():
     models_payload = {
         "data": [

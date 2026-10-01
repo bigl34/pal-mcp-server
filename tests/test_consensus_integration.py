@@ -124,6 +124,7 @@ async def test_consensus_multi_model_consultations(monkeypatch, openai_model):
         step1_arguments = {
             "step": "Evaluate SwiftUI vs UIKit adoption and recommend ONE word (SwiftUI or UIKit).",
             "step_number": 1,
+            "mode": "sequential",
             "total_steps": len(models_to_consult),
             "next_step_required": True,
             "findings": "SwiftUI momentum is strong but UIKit remains battle-tested.",
@@ -150,6 +151,7 @@ async def test_consensus_multi_model_consultations(monkeypatch, openai_model):
         step2_arguments = {
             "step": f"Incorporated {openai_model} perspective: {summary_for_step2}",
             "step_number": 2,
+            "mode": "sequential",
             "total_steps": len(models_to_consult),
             "next_step_required": False,
             "findings": "Ready to gather opposing stance before synthesis.",
@@ -250,6 +252,7 @@ async def test_consensus_auto_mode_with_openrouter_and_gemini(monkeypatch):
         step1_args = {
             "step": "Evaluate framework options.",
             "step_number": 1,
+            "mode": "sequential",
             "total_steps": len(models_to_consult),
             "next_step_required": True,
             "findings": "Initial analysis requested.",
@@ -272,6 +275,7 @@ async def test_consensus_auto_mode_with_openrouter_and_gemini(monkeypatch):
         step2_args = {
             "step": "Continue consultation sequence.",
             "step_number": 2,
+            "mode": "sequential",
             "total_steps": len(models_to_consult),
             "next_step_required": False,
             "findings": "Ready for next model.",

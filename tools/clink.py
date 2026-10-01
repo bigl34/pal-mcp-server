@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from clink import get_registry
 from clink.agents import AgentOutput, CLIAgentError, create_agent
+from clink.effort import REASONING_EFFORTS, effort_args
 from clink.models import ResolvedCLIClient, ResolvedCLIRole
 from config import TEMPERATURE_BALANCED
 from tools.models import ToolModelCategory, ToolOutput
@@ -52,6 +53,13 @@ class CLinkRequest(BaseModel):
             "Optional CLI model name. Use native to suppress clink model injection and let the CLI default apply."
         ),
     )
+    reasoning_effort: str | None = Field(
+        default=None,
+        description=(
+            "Optional reasoning effort for this call (low, medium, high, xhigh, max). "
+            "Supported by the codex and claude CLIs. Omit to keep the CLI's configured default."
+        ),
+    )
     absolute_file_paths: list[str] = Field(
         default_factory=list,
         description=COMMON_FIELD_DESCRIPTIONS["absolute_file_paths"],
@@ -64,6 +72,20 @@ class CLinkRequest(BaseModel):
         default=None,
         description=COMMON_FIELD_DESCRIPTIONS["continuation_id"],
     )
+
+    @field_validator("reasoning_effort", mode="before")
+    @classmethod
+    def _validate_reasoning_effort(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("reasoning_effort must be a string")
+        effort = value.strip().lower()
+        if not effort:
+            return None
+        if effort not in REASONING_EFFORTS:
+            raise ValueError(f"reasoning_effort must be one of {', '.join(REASONING_EFFORTS)}")
+        return effort
 
     @field_validator("model", mode="before")
     @classmethod
@@ -181,6 +203,14 @@ class CLinkTool(SimpleTool):
                     "default apply."
                 ),
             },
+            "reasoning_effort": {
+                "type": "string",
+                "enum": list(REASONING_EFFORTS),
+                "description": (
+                    "Optional reasoning effort for this call. Supported by the codex and claude CLIs; "
+                    "omit to keep the CLI's configured default."
+                ),
+            },
             "absolute_file_paths": SchemaBuilder.SIMPLE_FIELD_SCHEMAS["absolute_file_paths"],
             "images": SchemaBuilder.COMMON_FIELD_SCHEMAS["images"],
             "continuation_id": SchemaBuilder.COMMON_FIELD_SCHEMAS["continuation_id"],
@@ -224,6 +254,15 @@ class CLinkTool(SimpleTool):
         except KeyError as exc:
             self._raise_tool_error(str(exc))
 
+        if request.reasoning_effort:
+            try:
+                requested_effort_args = effort_args(
+                    client_config.runner or client_config.name, request.reasoning_effort
+                )
+            except ValueError as exc:
+                self._raise_tool_error(str(exc))
+            role_config = role_config.model_copy(update={"role_args": [*role_config.role_args, *requested_effort_args]})
+
         absolute_file_paths = self.get_request_files(request)
         images = self.get_request_images(request)
         continuation_id = self.get_request_continuation_id(request)
@@ -257,6 +296,8 @@ class CLinkTool(SimpleTool):
             )
         except CLIAgentError as exc:
             metadata = self._build_error_metadata(client_config, exc)
+            if request.reasoning_effort:
+                metadata["reasoning_effort"] = request.reasoning_effort
             self._raise_tool_error(
                 f"CLI '{client_config.name}' execution failed: {exc}",
                 metadata=metadata,
@@ -264,6 +305,8 @@ class CLinkTool(SimpleTool):
 
         metadata = self._build_success_metadata(client_config, role_config, result)
         metadata = self._prune_metadata(metadata, client_config, reason="normal")
+        if request.reasoning_effort:
+            metadata["reasoning_effort"] = request.reasoning_effort
 
         content, metadata = self._apply_output_limit(
             client_config,
