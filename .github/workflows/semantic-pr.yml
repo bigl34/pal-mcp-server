@@ -16,7 +16,7 @@ permissions:
 jobs:
   semantic-pr:
     name: Validate PR
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2-ubuntu-2404
     timeout-minutes: 5
     steps:
       - name: Check PR Title

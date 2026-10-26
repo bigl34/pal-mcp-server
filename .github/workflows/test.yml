@@ -6,7 +6,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2-ubuntu-2404
     strategy:
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
@@ -36,7 +36,7 @@ jobs:
           OPENAI_API_KEY: ""
 
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
 
